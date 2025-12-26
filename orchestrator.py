@@ -133,6 +133,9 @@ class ResponseSession:
         max_tokens: int,
         user_content: str,
         on_tts_chunk: Optional[Callable[[], None]] = None,
+        on_stream_start: Optional[Callable[[], None]] = None,
+        on_stream_done: Optional[Callable[[], None]] = None,
+        on_fragment: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.client = client
         self.tts = tts
@@ -141,6 +144,9 @@ class ResponseSession:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.on_tts_chunk = on_tts_chunk
+        self.on_stream_start = on_stream_start
+        self.on_stream_done = on_stream_done
+        self.on_fragment = on_fragment
         self.user_content = user_content
 
         self.full_reply: str = ""
@@ -163,6 +169,18 @@ class ResponseSession:
                 if self.on_tts_chunk:
                     self.on_tts_chunk()
 
+            def _on_start() -> None:
+                if self.on_stream_start:
+                    self.on_stream_start()
+
+            def _on_chunk(chunk: str) -> None:
+                if self.on_fragment:
+                    self.on_fragment(chunk)
+
+            def _on_done(_: str) -> None:
+                if self.on_stream_done:
+                    self.on_stream_done()
+
             def _chat_fragments():
                 for frag in self.client.chat_stream(
                     self.voice_model,
@@ -171,6 +189,8 @@ class ResponseSession:
                     max_tokens=self.max_tokens,
                 ):
                     print(frag, end="", flush=True)
+                    if self.on_fragment:
+                        self.on_fragment(frag)
                     yield frag
 
             self.full_reply = self.tts.stream_fragments(
@@ -178,11 +198,41 @@ class ResponseSession:
                 flush_chars=90,
                 max_wait_s=0.4,
                 on_speak=_on_speak,
+                on_start=_on_start,
+                on_chunk=_on_chunk,
+                on_complete=_on_done,
             )
         except Exception as e:  # pragma: no cover - safety net for background worker
             self.error = e
         finally:
             self._done.set()
+
+
+class SpeechBridge:
+    """Coordinate mic gating with live TTS streaming."""
+
+    def __init__(self, block_s: float) -> None:
+        self.block_s = block_s
+        self._block_until = 0.0
+        self._lock = threading.Lock()
+
+    def _extend(self) -> None:
+        with self._lock:
+            self._block_until = max(self._block_until, time.time() + self.block_s)
+
+    def on_stream_start(self) -> None:
+        self._extend()
+
+    def pulse(self) -> None:
+        self._extend()
+
+    def on_stream_end(self) -> None:
+        # Leave a small tail to let the room settle before listening again
+        self._extend()
+
+    def should_skip_audio(self) -> bool:
+        with self._lock:
+            return time.time() < self._block_until
 
 
 def main() -> None:
@@ -260,20 +310,28 @@ def main() -> None:
         pre_roll_s=0.25,
     )
 
+    live_thought_accum = ""
+
+    def on_generation_fragment(frag: str) -> None:
+        nonlocal live_thought_accum
+        if not frag:
+            return
+        live_thought_accum += frag
+        # Keep a small rolling window of what was just said for sensory context
+        if len(live_thought_accum) > 320:
+            live_thought_accum = live_thought_accum[-320:]
+        buf.add("audio", f"[voice-stream] {frag.strip()}")
+        speech_bridge.pulse()
+
     cam.start()
     mic.start()
 
     # Block microphone processing for a short time after TTS plays, to avoid the mic
     # re-transcribing Astra's own voice (feedback loop).
-    tts_block_until: float = 0.0
+    speech_bridge = SpeechBridge(block_s=float(env("TTS_BLOCK_S", "1.2")))
 
     # Live response session (LM -> TTS) runs in background to keep sensing snappy.
     response_session: Optional[ResponseSession] = None
-    tts_block_s = float(env("TTS_BLOCK_S", "1.2"))
-
-    def extend_tts_block() -> None:
-        nonlocal tts_block_until
-        tts_block_until = time.time() + tts_block_s
 
     last_inject = 0.0
     last_frame_bgr = None
@@ -290,7 +348,7 @@ def main() -> None:
             # Vision
             # ---------------------------
             if response_session and response_session.is_active():
-                extend_tts_block()
+                speech_bridge.pulse()
 
             try:
                 obs = cam.read()
@@ -312,8 +370,7 @@ def main() -> None:
 
             try:
                 chunk = mic.read_chunk()
-                now_audio = time.time()
-                if now_audio < tts_block_until:
+                if speech_bridge.should_skip_audio():
                     # Avoid transcribing our own TTS (headphones still recommended)
                     raise _SkipAudio()
                 pcm = np.asarray(chunk.pcm)
@@ -493,6 +550,8 @@ def main() -> None:
                     print("\n[Inject -> VOICE]\n" + sensory_block)
                     print("[Astra]>", end=" ", flush=True)
 
+                    live_thought_accum = ""
+
                     response_session = ResponseSession(
                         client=client,
                         tts=tts,
@@ -501,10 +560,13 @@ def main() -> None:
                         temperature=0.6,
                         max_tokens=int(env("LM_MAX_TOKENS", "550")),
                         user_content=user_content,
-                        on_tts_chunk=extend_tts_block,
+                        on_tts_chunk=speech_bridge.pulse,
+                        on_stream_start=speech_bridge.on_stream_start,
+                        on_stream_done=speech_bridge.on_stream_end,
+                        on_fragment=on_generation_fragment,
                     )
                     response_session.start()
-                    extend_tts_block()
+                    speech_bridge.on_stream_start()
                 else:
                     print("\n[Silent tick]", internal_note)
 
@@ -519,7 +581,7 @@ def main() -> None:
                 else:
                     full_reply = response_session.full_reply
                     if full_reply.strip():
-                        extend_tts_block()
+                        speech_bridge.on_stream_end()
                     presence.mark_spoke()
                     recent_dialogue.append({"role": "user", "content": response_session.user_content})
                     recent_dialogue.append({"role": "assistant", "content": full_reply})

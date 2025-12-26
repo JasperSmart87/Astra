@@ -112,6 +112,9 @@ class PiperTTS:
         flush_chars: int = 120,
         max_wait_s: float = 1.2,
         on_speak: Optional[Callable[[str], None]] = None,
+        on_start: Optional[Callable[[], None]] = None,
+        on_chunk: Optional[Callable[[str], None]] = None,
+        on_complete: Optional[Callable[[str], None]] = None,
     ) -> str:
         """Speak fragments as they arrive while preserving flow.
 
@@ -125,25 +128,34 @@ class PiperTTS:
         if not self.enabled or self.voice is None:
             for frag in fragments:
                 if frag:
+                    if on_chunk:
+                        on_chunk(frag)
                     full_text += frag
+            if on_complete:
+                on_complete(full_text)
             return full_text
 
         buf = ""
         last_flush = time.time()
+        if on_start:
+            on_start()
 
         for frag in fragments:
             if not frag:
                 continue
 
             full_text += frag
+            if on_chunk:
+                on_chunk(frag)
             buf += frag
             now = time.time()
 
             enough_chars = len(buf) >= flush_chars
             waited = (now - last_flush) >= max_wait_s
-            has_sentence = any(d in buf for d in (". ", "? ", "! "))
+            has_sentence = any(d in buf for d in (". ", "? ", "! ", "\n"))
+            impatient = waited and len(buf) >= max(12, flush_chars // 3)
 
-            if enough_chars or (waited and has_sentence):
+            if enough_chars or (waited and has_sentence) or impatient:
                 speakable, buf = self._split_flush_segment(buf)
                 if speakable:
                     if on_speak:
@@ -156,5 +168,8 @@ class PiperTTS:
             if on_speak:
                 on_speak(buf)
             self.speak(buf)
+
+        if on_complete:
+            on_complete(full_text)
 
         return full_text
