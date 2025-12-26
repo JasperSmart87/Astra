@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional, Tuple
 
 try:
     from piper import PiperVoice  # type: ignore
@@ -85,3 +85,70 @@ class PiperTTS:
             )
         except Exception as e:
             print("[TTS] error:", e)
+
+    # --- Streaming helpers -------------------------------------------------
+    def _split_flush_segment(self, buf: str) -> Tuple[str, str]:
+        """Split buffered text into a speakable chunk and a remainder.
+
+        Prefer to flush at sentence boundaries so the speech sounds natural.
+        If no obvious boundary exists, flush the whole buffer.
+        """
+
+        last_sentence_end = -1
+        for delim in (". ", "? ", "! "):
+            idx = buf.rfind(delim)
+            last_sentence_end = max(last_sentence_end, idx)
+
+        if last_sentence_end != -1:
+            cut = last_sentence_end + 1
+            return buf[:cut].strip(), buf[cut:]
+
+        return buf.strip(), ""
+
+    def stream_fragments(
+        self,
+        fragments: Iterable[str],
+        flush_chars: int = 120,
+        max_wait_s: float = 1.2,
+    ) -> str:
+        """Speak fragments as they arrive while preserving flow.
+
+        Accumulates fragments, flushing to TTS when enough content is present
+        or when a small amount of time passes. Returns the concatenated text.
+        """
+
+        full_text = ""
+
+        # If TTS is disabled, just join fragments without blocking.
+        if not self.enabled or self.voice is None:
+            for frag in fragments:
+                if frag:
+                    full_text += frag
+            return full_text
+
+        buf = ""
+        last_flush = time.time()
+
+        for frag in fragments:
+            if not frag:
+                continue
+
+            full_text += frag
+            buf += frag
+            now = time.time()
+
+            enough_chars = len(buf) >= flush_chars
+            waited = (now - last_flush) >= max_wait_s
+            has_sentence = any(d in buf for d in (". ", "? ", "! "))
+
+            if enough_chars or (waited and has_sentence):
+                speakable, buf = self._split_flush_segment(buf)
+                if speakable:
+                    self.speak(speakable)
+                    last_flush = time.time()
+
+        # Flush any trailing text
+        if buf.strip():
+            self.speak(buf)
+
+        return full_text

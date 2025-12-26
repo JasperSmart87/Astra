@@ -410,21 +410,23 @@ def main() -> None:
                     print("\n[Inject -> VOICE]\n" + sensory_block)
                     print("[Astra]>", end=" ", flush=True)
 
-                    full_reply = ""
-                    for frag in client.chat_stream(
-                        voice_model,
-                        messages,
-                        temperature=0.6,
-                        max_tokens=int(env("LM_MAX_TOKENS", "550")),
-                    ):
-                        print(frag, end="", flush=True)
-                        full_reply += frag
+                    
+                    def _chat_fragments():
+                        for frag in client.chat_stream(
+                            voice_model,
+                            messages,
+                            temperature=0.6,
+                            max_tokens=int(env("LM_MAX_TOKENS", "550")),
+                        ):
+                            print(frag, end="", flush=True)
+                            yield frag
+
+                    full_reply = tts.stream_fragments(_chat_fragments())
 
                     print("\n" + "-" * 60)
                     presence.mark_spoke()
 
                     if full_reply.strip():
-                        tts.speak(full_reply)
                         tts_block_until = time.time() + float(env("TTS_BLOCK_S", "1.2"))
 
                     recent_dialogue.append({"role": "user", "content": user_content})
