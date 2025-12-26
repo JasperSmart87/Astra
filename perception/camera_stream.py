@@ -63,11 +63,12 @@ class CameraSensor:
             diff = cv2.absdiff(gray, self.prev_gray)
             motion = float(np.mean(diff))
         self.prev_gray = gray
-        return CameraObservation(motion=motion,
-    brightness=brightness,
-    frame=frame,   # <-- PASS THE FRAME THROUGH
-    ts=time.time()
-)
+        return CameraObservation(
+            motion=motion,
+            brightness=brightness,
+            frame=frame,  # <-- PASS THE FRAME THROUGH
+            ts=time.time(),
+        )
 
     def stop(self) -> None:
         if self.cap is not None:
