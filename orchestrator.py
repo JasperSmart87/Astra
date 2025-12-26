@@ -53,34 +53,40 @@ def env(key: str, default: str = "") -> str:
     return v if v is not None and v != "" else default
 
 
-def safe_add_vision(buf: RingBuffer, obs: Any) -> Optional[Any]:
+def safe_add_vision(buf: RingBuffer, obs: Any) -> tuple[Optional[Any], Optional[str]]:
     """Add a vision observation to the buffer.
 
-    Returns a usable frame (BGR) if present, else None.
+    Returns (frame_bgr, text) so that callers can stream the textual part into
+    the live context alongside the audio and VLM streams.
     """
     frame_bgr = None
+    text: Optional[str] = None
 
     if isinstance(obs, str):
         buf.add("vision", obs)
-        return None
+        text = obs
+        return None, text
 
     if hasattr(obs, "to_text") and callable(getattr(obs, "to_text")):
         try:
-            buf.add("vision", obs.to_text())
+            text = obs.to_text()
+            buf.add("vision", text)
         except Exception:
-            buf.add("vision", str(obs))
+            text = str(obs)
+            buf.add("vision", text)
     elif isinstance(obs, dict):
-        txt = obs.get("text") or obs.get("summary") or str(obs)
-        buf.add("vision", txt)
+        text = obs.get("text") or obs.get("summary") or str(obs)
+        buf.add("vision", text)
     else:
-        buf.add("vision", str(obs))
+        text = str(obs)
+        buf.add("vision", text)
 
     if hasattr(obs, "frame_bgr"):
         frame_bgr = getattr(obs, "frame_bgr")
     elif hasattr(obs, "frame"):
         frame_bgr = getattr(obs, "frame")
 
-    return frame_bgr
+    return frame_bgr, text
 
 
 def make_wake_normalizer(wake_name: str):
@@ -126,6 +132,70 @@ def loudest_channel(pcm: np.ndarray) -> np.ndarray:
     return pcm[:, loudest_idx]
 
 
+class LiveStreamFusion:
+    """Fuses sight, sound, speech, and thought into a live context snapshot."""
+
+    def __init__(self) -> None:
+        now = time.time()
+        self._sight: tuple[str, float] = ("", now)
+        self._sound: tuple[str, float] = ("", now)
+        self._thought: tuple[str, float] = ("", now)
+        self._identity: tuple[str, float] = ("unknown", now)
+
+    def update_sight(self, text: Optional[str]) -> None:
+        if text:
+            self._sight = (text.strip(), time.time())
+
+    def update_sound(self, committed: str, partial: str) -> None:
+        candidate = (committed or "").strip()
+        if partial:
+            candidate = f"{candidate} {partial}".strip() if candidate else partial.strip()
+        if candidate:
+            self._sound = (candidate, time.time())
+
+    def clear_sound(self) -> None:
+        self._sound = ("", time.time())
+
+    def update_thought(self, fragment: str) -> None:
+        frag = fragment.strip()
+        if not frag:
+            return
+        existing, ts = self._thought
+        if (time.time() - ts) > 4.0:
+            existing = ""
+        merged = (existing + frag)[-320:]
+        self._thought = (merged, time.time())
+
+    def update_identity(self, identities: set[str]) -> None:
+        label = ", ".join(sorted(identities)) if identities else "unknown"
+        self._identity = (label, time.time())
+
+    def snapshot(self) -> str:
+        now = time.time()
+
+        def fresh(entry: tuple[str, float], ttl: float) -> Optional[str]:
+            txt, ts = entry
+            if txt and (now - ts) <= ttl:
+                return txt
+            return None
+
+        lines = []
+        sight = fresh(self._sight, 6.0)
+        if sight:
+            lines.append(f"SIGHT: {sight}")
+        sound = fresh(self._sound, 3.0)
+        if sound:
+            lines.append(f"SOUND: {sound}")
+        who = fresh(self._identity, 8.0)
+        if who:
+            lines.append(f"IDENTITY: {who}")
+        thought = fresh(self._thought, 5.0)
+        if thought:
+            lines.append(f"THOUGHT: {thought}")
+
+        return "\n".join(lines)
+
+
 class ResponseSession:
     """Run LM -> TTS streaming in a background thread.
 
@@ -143,7 +213,7 @@ class ResponseSession:
         temperature: float,
         max_tokens: int,
         user_content: str,
-        on_tts_chunk: Optional[Callable[[], None]] = None,
+        on_tts_chunk: Optional[Callable[[str], None]] = None,
         on_stream_start: Optional[Callable[[], None]] = None,
         on_stream_done: Optional[Callable[[], None]] = None,
         on_fragment: Optional[Callable[[str], None]] = None,
@@ -178,7 +248,7 @@ class ResponseSession:
         try:
             def _on_speak(_: str) -> None:
                 if self.on_tts_chunk:
-                    self.on_tts_chunk()
+                    self.on_tts_chunk(_)
 
             def _on_start() -> None:
                 if self.on_stream_start:
@@ -227,19 +297,27 @@ class SpeechBridge:
         self._block_until = 0.0
         self._lock = threading.Lock()
 
-    def _extend(self) -> None:
+    def _extend(self, extra_s: float = 0.0) -> None:
         with self._lock:
-            self._block_until = max(self._block_until, time.time() + self.block_s)
+            self._block_until = max(self._block_until, time.time() + self.block_s + extra_s)
+
+    @staticmethod
+    def _estimate_phrase_block(text: Optional[str]) -> float:
+        if not text:
+            return 0.0
+        words = max(1, len(text.split()))
+        # Roughly scale block by phrase length to avoid re-hearing ourselves.
+        return min(2.5, 0.08 * words)
 
     def on_stream_start(self) -> None:
         self._extend()
 
-    def pulse(self) -> None:
-        self._extend()
+    def pulse(self, text: Optional[str] = None) -> None:
+        self._extend(self._estimate_phrase_block(text))
 
     def on_stream_end(self) -> None:
         # Leave a small tail to let the room settle before listening again
-        self._extend()
+        self._extend(0.25)
 
     def should_skip_audio(self) -> bool:
         with self._lock:
@@ -321,6 +399,7 @@ def main() -> None:
         pre_roll_s=0.25,
     )
 
+    live_streams = LiveStreamFusion()
     live_thought_accum = ""
 
     def on_generation_fragment(frag: str) -> None:
@@ -332,7 +411,8 @@ def main() -> None:
         if len(live_thought_accum) > 320:
             live_thought_accum = live_thought_accum[-320:]
         buf.add("audio", f"[voice-stream] {frag.strip()}")
-        speech_bridge.pulse()
+        speech_bridge.pulse(frag)
+        live_streams.update_thought(frag)
 
     cam.start()
     mic.start()
@@ -363,7 +443,8 @@ def main() -> None:
 
             try:
                 obs = cam.read()
-                frame_bgr = safe_add_vision(buf, obs)
+                frame_bgr, vision_text = safe_add_vision(buf, obs)
+                live_streams.update_sight(vision_text)
                 if frame_bgr is not None:
                     _ = identity.process(frame_bgr)
                     current_identities = set(identity.present)
@@ -423,6 +504,7 @@ def main() -> None:
                             buf.add("audio", f"[audio-live] {committed}")
                             last_heard_text = committed
                             last_heard_ts = time.time()
+                    live_streams.update_sound(upd.committed, upd.partial)
 
                 # Utterance collector (final transcript)
                 ready = collector.push(pcm)
@@ -448,6 +530,7 @@ def main() -> None:
                             buf.add("audio", f"[audio] {transcript}")
                             last_heard_text = transcript
                             last_heard_ts = time.time()
+                            live_streams.update_sound(transcript, "")
             except _SkipAudio:
                 # Mic is muted for a moment (usually while TTS is speaking).
                 pass
@@ -504,6 +587,7 @@ def main() -> None:
                 else:
                     who = "unknown"
                     buf.add("vision", "[identity] present=unknown")
+                live_streams.update_identity(who_set)
 
                 # VLM caption occasionally
                 if vlm.enabled() and last_frame_bgr is not None:
@@ -519,6 +603,7 @@ def main() -> None:
                         cap = vlm.caption(last_frame_bgr, prompt, max_tokens=120)
                         if cap:
                             buf.add("vision", f"[vision-vlm] {cap}")
+                            live_streams.update_sight(cap)
                     except Exception as e:
                         buf.add("vision", f"[vision-vlm] error: {e}")
 
@@ -534,6 +619,7 @@ def main() -> None:
 
                 active_response = response_session and response_session.is_active()
                 if decision.should_respond and not active_response:
+                    live_context = live_streams.snapshot()
                     user_content = (
                         f"SENSORY_UPDATE:\n{sensory_block}\n\n"
                         f"INTERNAL_STATE:\n{internal_note}\n\n"
@@ -542,6 +628,8 @@ def main() -> None:
                         f"- Respond naturally, like a person in the room.\n"
                         f"- Keep it short and conversational unless asked otherwise.\n"
                     )
+                    if live_context:
+                        user_content += f"\nLIVE_STREAM:\n{live_context}\n"
                     if pending_memory is not None:
                         user_content += "\nMEMORY_QUESTION:\nShould I remember the last thing you said for next time? (yes/no)\n"
 
