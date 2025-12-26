@@ -1,0 +1,17 @@
+## Example environment configuration
+# Copy this file to `.env` and edit the values as needed.
+
+# Base URL of your LM Studio local server (must include /v1)
+LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1
+
+# Identifier of the chat model to use (as shown in LM Studio)
+LMSTUDIO_MODEL=nuofang/tifa-deepsexv2-7b-mgrpo
+# (Optional) Identifier of the vision-language model for image captioning
+VLM_MODEL=llama-joycaption-beta-one-hf-llava-mmproj
+
+# The name the agent will respond to
+WAKE_NAME=Astra
+CAMERA_INDEX=1
+AUDIO_DEVICE=1
+AUDIO_SAMPLE_RATE=44100
+AUDIO_CHUNK_SECONDS=7

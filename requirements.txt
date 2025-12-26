@@ -1,0 +1,9 @@
+opencv-python
+pyaudio
+sounddevice
+faster-whisper
+pillow
+python-dotenv
+requests
+numpy
+soundfile
