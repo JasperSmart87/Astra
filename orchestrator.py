@@ -115,6 +115,17 @@ def audio_levels(pcm: np.ndarray) -> tuple[float, float, bool]:
     return rms, peak, clipped
 
 
+def loudest_channel(pcm: np.ndarray) -> np.ndarray:
+    """Pick the loudest channel instead of averaging away signal energy."""
+    if pcm.ndim != 2 or pcm.shape[1] <= 1:
+        return pcm
+
+    # Compute RMS per channel and keep the strongest one so VAD sees it.
+    rms_per_ch = np.sqrt(np.mean(np.square(pcm), axis=0) + 1e-12)
+    loudest_idx = int(np.argmax(rms_per_ch))
+    return pcm[:, loudest_idx]
+
+
 class ResponseSession:
     """Run LM -> TTS streaming in a background thread.
 
@@ -375,15 +386,14 @@ def main() -> None:
                     raise _SkipAudio()
                 pcm = np.asarray(chunk.pcm)
 
-                # force mono
-                if pcm.ndim == 2 and pcm.shape[1] >= 2:
-                    pcm = pcm.mean(axis=1)
-
                 # force float32 [-1,1]
                 if pcm.dtype != np.float32 and pcm.dtype != np.float64:
                     pcm = pcm.astype(np.float32) / 32768.0
                 else:
                     pcm = pcm.astype(np.float32, copy=False)
+
+                # keep the loudest input channel to avoid losing level when averaging
+                pcm = loudest_channel(pcm)
 
                 rms, peak, clipped = audio_levels(pcm)
                 print(f"[AUDIO][LEVEL] rms={rms:.6f} peak={peak:.3f} clip={clipped}")
