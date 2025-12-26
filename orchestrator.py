@@ -18,8 +18,9 @@ class _SkipAudio(Exception):
 
 import os
 import re
+import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 from dotenv import load_dotenv
@@ -114,6 +115,76 @@ def audio_levels(pcm: np.ndarray) -> tuple[float, float, bool]:
     return rms, peak, clipped
 
 
+class ResponseSession:
+    """Run LM -> TTS streaming in a background thread.
+
+    This keeps the main loop free to continue sensing while speech plays
+    out, improving the feeling of a live, full-duplex assistant.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: LMStudioClient,
+        tts: PiperTTS,
+        voice_model: str,
+        messages: list[dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+        user_content: str,
+        on_tts_chunk: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self.client = client
+        self.tts = tts
+        self.voice_model = voice_model
+        self.messages = messages
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.on_tts_chunk = on_tts_chunk
+        self.user_content = user_content
+
+        self.full_reply: str = ""
+        self.error: Optional[Exception] = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._done = threading.Event()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def is_active(self) -> bool:
+        return not self._done.is_set()
+
+    def wait(self, timeout: Optional[float] = None) -> None:
+        self._thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        try:
+            def _on_speak(_: str) -> None:
+                if self.on_tts_chunk:
+                    self.on_tts_chunk()
+
+            def _chat_fragments():
+                for frag in self.client.chat_stream(
+                    self.voice_model,
+                    self.messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                ):
+                    print(frag, end="", flush=True)
+                    yield frag
+
+            self.full_reply = self.tts.stream_fragments(
+                _chat_fragments(),
+                flush_chars=90,
+                max_wait_s=0.4,
+                on_speak=_on_speak,
+            )
+        except Exception as e:  # pragma: no cover - safety net for background worker
+            self.error = e
+        finally:
+            self._done.set()
+
+
 def main() -> None:
     base_url = SETTINGS.lmstudio_base_url
     api_key = SETTINGS.lmstudio_api_key
@@ -196,6 +267,14 @@ def main() -> None:
     # re-transcribing Astra's own voice (feedback loop).
     tts_block_until: float = 0.0
 
+    # Live response session (LM -> TTS) runs in background to keep sensing snappy.
+    response_session: Optional[ResponseSession] = None
+    tts_block_s = float(env("TTS_BLOCK_S", "1.2"))
+
+    def extend_tts_block() -> None:
+        nonlocal tts_block_until
+        tts_block_until = time.time() + tts_block_s
+
     last_inject = 0.0
     last_frame_bgr = None
 
@@ -210,6 +289,9 @@ def main() -> None:
             # ---------------------------
             # Vision
             # ---------------------------
+            if response_session and response_session.is_active():
+                extend_tts_block()
+
             try:
                 obs = cam.read()
                 frame_bgr = safe_add_vision(buf, obs)
@@ -383,7 +465,8 @@ def main() -> None:
                     f"confidence={decision.confidence:.2f}"
                 )
 
-                if decision.should_respond:
+                active_response = response_session and response_session.is_active()
+                if decision.should_respond and not active_response:
                     user_content = (
                         f"SENSORY_UPDATE:\n{sensory_block}\n\n"
                         f"INTERNAL_STATE:\n{internal_note}\n\n"
@@ -410,26 +493,35 @@ def main() -> None:
                     print("\n[Inject -> VOICE]\n" + sensory_block)
                     print("[Astra]>", end=" ", flush=True)
 
-                    
-                    def _chat_fragments():
-                        for frag in client.chat_stream(
-                            voice_model,
-                            messages,
-                            temperature=0.6,
-                            max_tokens=int(env("LM_MAX_TOKENS", "550")),
-                        ):
-                            print(frag, end="", flush=True)
-                            yield frag
+                    response_session = ResponseSession(
+                        client=client,
+                        tts=tts,
+                        voice_model=voice_model,
+                        messages=messages,
+                        temperature=0.6,
+                        max_tokens=int(env("LM_MAX_TOKENS", "550")),
+                        user_content=user_content,
+                        on_tts_chunk=extend_tts_block,
+                    )
+                    response_session.start()
+                    extend_tts_block()
+                else:
+                    print("\n[Silent tick]", internal_note)
 
-                    full_reply = tts.stream_fragments(_chat_fragments())
+                buf.clear()
+                last_inject = now
 
-                    print("\n" + "-" * 60)
-                    presence.mark_spoke()
-
+            if response_session and (not response_session.is_active()):
+                print("\n" + "-" * 60)
+                if response_session.error:
+                    print("[VOICE] response error:", response_session.error)
+                    buf.add("audio", f"[voice] error: {response_session.error}")
+                else:
+                    full_reply = response_session.full_reply
                     if full_reply.strip():
-                        tts_block_until = time.time() + float(env("TTS_BLOCK_S", "1.2"))
-
-                    recent_dialogue.append({"role": "user", "content": user_content})
+                        extend_tts_block()
+                    presence.mark_spoke()
+                    recent_dialogue.append({"role": "user", "content": response_session.user_content})
                     recent_dialogue.append({"role": "assistant", "content": full_reply})
                     recent_dialogue = recent_dialogue[-20:]
 
@@ -445,11 +537,8 @@ def main() -> None:
                             print("[SUMMARY] updated")
                         except Exception as e:
                             print("[SUMMARY] update failed:", e)
-                else:
-                    print("\n[Silent tick]", internal_note)
 
-                buf.clear()
-                last_inject = now
+                response_session = None
 
     except KeyboardInterrupt:
         print("\nStopping orchestrator...")

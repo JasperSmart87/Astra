@@ -7,8 +7,9 @@ Adds a small text-cleaning pass to avoid weird characters being spoken
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
-from typing import Iterable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
 try:
     from piper import PiperVoice  # type: ignore
@@ -110,6 +111,7 @@ class PiperTTS:
         fragments: Iterable[str],
         flush_chars: int = 120,
         max_wait_s: float = 1.2,
+        on_speak: Optional[Callable[[str], None]] = None,
     ) -> str:
         """Speak fragments as they arrive while preserving flow.
 
@@ -144,11 +146,15 @@ class PiperTTS:
             if enough_chars or (waited and has_sentence):
                 speakable, buf = self._split_flush_segment(buf)
                 if speakable:
+                    if on_speak:
+                        on_speak(speakable)
                     self.speak(speakable)
                     last_flush = time.time()
 
         # Flush any trailing text
         if buf.strip():
+            if on_speak:
+                on_speak(buf)
             self.speak(buf)
 
         return full_text
