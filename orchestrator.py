@@ -459,7 +459,13 @@ def main() -> None:
         speech_bridge.pulse(frag)
         live_streams.update_thought(frag)
 
-    cam.start()
+    cam_available = True
+    try:
+        cam.start()
+    except Exception as e:
+        cam_available = False
+        print(f"[VISION] camera disabled: {e}")
+
     mic.start()
 
     # Block microphone processing for a short time after TTS plays, to avoid the mic
@@ -490,20 +496,21 @@ def main() -> None:
             if response_session and response_session.is_active():
                 speech_bridge.pulse()
 
-            try:
-                obs = cam.read()
-                frame_bgr, vision_text = safe_add_vision(buf, obs)
-                live_streams.update_sight(vision_text)
-                vision_context.add(vision_text)
-                if frame_bgr is not None:
-                    _ = identity.process(frame_bgr)
-                    current_identities = set(identity.present)
-                    if current_identities:
-                        last_known_identities = set(current_identities)
-                        last_identity_ts = time.time()
-                    last_frame_bgr = frame_bgr
-            except Exception as e:
-                buf.add("vision", f"[vision] error: {e}")
+            if cam_available:
+                try:
+                    obs = cam.read()
+                    frame_bgr, vision_text = safe_add_vision(buf, obs)
+                    live_streams.update_sight(vision_text)
+                    vision_context.add(vision_text)
+                    if frame_bgr is not None:
+                        _ = identity.process(frame_bgr)
+                        current_identities = set(identity.present)
+                        if current_identities:
+                            last_known_identities = set(current_identities)
+                            last_identity_ts = time.time()
+                        last_frame_bgr = frame_bgr
+                except Exception as e:
+                    buf.add("vision", f"[vision] error: {e}")
 
             # ---------------------------
             # Audio
