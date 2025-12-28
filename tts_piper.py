@@ -130,10 +130,7 @@ class PiperTTS:
     def _iter_to_audio(self, audio_iter) -> Tuple[Optional[np.ndarray], Optional[int]]:
         """Convert a Piper audio iterator into float32 PCM data and sample rate."""
 
-        chunks = []
-        sample_rate = getattr(getattr(self.voice, "config", None), "sample_rate", 24000)
-
-        for chunk in audio_iter:
+        def _extract(chunk) -> Optional[np.ndarray]:
             if chunk is None:
                 continue
 
@@ -148,7 +145,9 @@ class PiperTTS:
                 arr = np.asarray(chunk)
 
             if arr.size == 0:
-                continue
+                return None
+            if arr.ndim > 1:
+                arr = arr[:, 0]
             if np.issubdtype(arr.dtype, np.integer):
                 arr = arr.astype(np.float32) / 32768.0
             else:
