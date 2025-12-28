@@ -33,6 +33,8 @@ class PiperConfig:
 
 
 def clean_tts_text(text: str) -> str:
+    """Clean text before sending to Piper."""
+
     if not text:
         return ""
 
@@ -167,9 +169,6 @@ class PiperTTS:
         cleaned = clean_tts_text(text)
         if not cleaned:
             return
-
-        # Optional: debug print what we actually send to TTS
-        # print("[TTS][CLEAN]", cleaned)
 
         try:
             audio_data, sample_rate = self._render_audio(cleaned, {})
