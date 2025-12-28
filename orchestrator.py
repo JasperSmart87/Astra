@@ -426,7 +426,7 @@ def main() -> None:
     # Presence helper: hold most recent heard speech briefly
     last_heard_text = ""
     last_heard_ts = 0.0
-    HEARD_HOLD_S = 2.5
+    HEARD_HOLD_S = 4.0
 
     # Identity
     identity = IdentityRecognizer(
@@ -540,11 +540,18 @@ def main() -> None:
                             print(f"  {a:5.2f}s → {b:5.2f}s | {t!r}")
                         print("[WHISPER][STREAM][END]\n")
 
-                    if DEBUG_PARTIALS and upd.partial:
-                        nowp = time.time()
-                        if (nowp - last_partial_print) >= 0.5:
-                            print(f"[WHISPER][STREAM][PARTIAL] {upd.partial!r}")
-                            last_partial_print = nowp
+                    if upd.partial:
+                        partial_norm = normalize_wake(upd.partial.strip())
+                        if DEBUG_PARTIALS:
+                            nowp = time.time()
+                            if (nowp - last_partial_print) >= 0.5:
+                                print(f"[WHISPER][STREAM][PARTIAL] {partial_norm!r}")
+                                last_partial_print = nowp
+
+                        # If the live partial already sounds like an address, keep it warm
+                        if partial_norm and presence._contains_wake_name(partial_norm):
+                            last_heard_text = partial_norm
+                            last_heard_ts = time.time()
 
                     if upd.committed:
                         committed = normalize_wake(upd.committed.strip())
