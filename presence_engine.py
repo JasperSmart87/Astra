@@ -13,7 +13,7 @@ Wake detection:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from email.mime import text
+import difflib
 import re
 import time
 
@@ -23,16 +23,23 @@ except Exception:  # pragma: no cover
     _rf_ratio = None
 
 
+def _diff_ratio(a: str, b: str) -> int:
+    """Lightweight built-in fuzzy score (0-100) when rapidfuzz is unavailable."""
+
+    # difflib returns 0..1; scale to 0..100 to mirror RapidFuzz's contract.
+    return int(difflib.SequenceMatcher(None, a, b).ratio() * 100)
+
+
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9\s]+", " ", (s or "").lower()).strip()
 
 
 def fuzzy_wake(t_norm: str, wake_norm: str, threshold: int = 80) -> bool:
     """Return True if any word in t_norm is a fuzzy match for wake_norm."""
-    if not _rf_ratio:
-        return False
+    score = _rf_ratio or _diff_ratio
+    effective_threshold = threshold if score is _rf_ratio else max(55, threshold - 25)
     for w in t_norm.split():
-        if _rf_ratio(w, wake_norm) >= threshold:
+        if score(w, wake_norm) >= effective_threshold:
             return True
     return False
 
@@ -58,6 +65,12 @@ class PresenceEngine:
     def __init__(self, wake_name: str = "Astra", cooldown_s: float = 6.0) -> None:
         self.state = PresenceState(wake_name=wake_name, cooldown_s=cooldown_s)
         self._last_tick = time.time()
+
+        if _rf_ratio is None:
+            print(
+                "[PRESENCE] rapidfuzz not installed; using built-in fuzzy fallback."
+                " Install full requirements for best wake detection."
+            )
 
     def tick(self, transcript_text: str) -> None:
         """Update slow-changing internal state based on conversation activity."""
