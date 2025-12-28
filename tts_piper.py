@@ -136,13 +136,24 @@ class PiperTTS:
         for chunk in audio_iter:
             if chunk is None:
                 continue
-            arr = np.asarray(chunk)
+
+            # Piper may emit custom chunk containers; prefer the raw PCM payload when present.
+            pcm = getattr(chunk, "pcm", None)
+            if pcm is not None:
+                arr = np.asarray(pcm)
+                chunk_rate = getattr(chunk, "sample_rate", None)
+                if chunk_rate:
+                    sample_rate = chunk_rate
+            else:
+                arr = np.asarray(chunk)
+
             if arr.size == 0:
                 continue
             if np.issubdtype(arr.dtype, np.integer):
                 arr = arr.astype(np.float32) / 32768.0
             else:
                 arr = arr.astype(np.float32)
+            arr = arr.reshape(-1)
             chunks.append(arr)
 
         if not chunks:
