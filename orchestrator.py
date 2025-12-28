@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 from agent.prompts import SYSTEM_PROMPT
 from config import SETTINGS
 from lmstudio_client import LMStudioClient
-from presence_engine import PresenceEngine
+from presence_engine import Decision, PresenceEngine
 
 from perception.audio_stream import MicrophoneSensor
 from perception.camera_stream import CameraSensor
@@ -44,6 +44,7 @@ from memory.memory_policy import hybrid_decide
 from memory.memory_summarize import update_summary, load_summary
 from memory.memory_condense import condense_memories
 from memory.memory_pack import build_messages
+from memory.memory_retrieve import retrieve
 
 from tts_piper import PiperTTS, PiperConfig
 from vision_vlm import VLMCaptioner
@@ -113,6 +114,17 @@ def make_wake_normalizer(wake_name: str):
         return t
 
     return normalize
+
+
+def format_identity_memories(name: str, memories: List[MemoryItem], limit: int = 5) -> str:
+    """Return a bullet list of memories relevant to the identified person."""
+
+    scored = retrieve(name, memories, k=limit)
+    if not scored:
+        return ""
+
+    lines = [f"- ({m.kind}, imp={m.importance:.2f}) {m.content}" for _, m in scored]
+    return "\n".join(lines)
 
 
 def audio_levels(pcm: np.ndarray) -> tuple[float, float, bool]:
@@ -511,6 +523,10 @@ def main() -> None:
     last_identity_ts = 0.0
     last_known_identities: set[str] = set()
 
+    identity_greeting_cooldown_s = float(env("IDENTITY_GREETING_COOLDOWN_S", "120"))
+    pending_identity_greetings: Dict[str, float] = {}
+    last_identity_greeting: Dict[str, float] = {}
+
     # Utterance collector
     collector = UtteranceCollector(
         sample_rate=SETTINGS.audio_sample_rate,
@@ -590,6 +606,15 @@ def main() -> None:
                         buf.add("vision", f"[identity] {', '.join(sorted(current_identities))}")
                         if is_new_identity and not force_inject_reason:
                             force_inject_reason = "New identity detected"
+                        for name in current_identities:
+                            if name == "unknown":
+                                continue
+                            last_greet = last_identity_greeting.get(name, 0.0)
+                            if (
+                                (time.time() - last_greet) >= identity_greeting_cooldown_s
+                                and name not in pending_identity_greetings
+                            ):
+                                pending_identity_greetings[name] = time.time()
                     motion_score = frame_motion_score(frame_bgr, prev_frame_bgr)
                     last_motion_score = motion_score
                     if motion_score >= vlm_motion_threshold * 0.6:
@@ -659,8 +684,12 @@ def main() -> None:
                             print(f"  {a:5.2f}s → {b:5.2f}s | {t!r}")
                         print("[WHISPER][STREAM][END]\n")
 
+                    normalized_committed = None
+                    normalized_partial = None
+
                     if upd.partial:
                         partial_norm = normalize_wake(upd.partial.strip())
+                        normalized_partial = partial_norm
                         if DEBUG_PARTIALS:
                             nowp = time.time()
                             if (nowp - last_partial_print) >= 0.5:
@@ -674,12 +703,16 @@ def main() -> None:
 
                     if upd.committed:
                         committed = normalize_wake(upd.committed.strip())
+                        normalized_committed = committed
                         if committed:
                             print(f"[WHISPER][STREAM][COMMIT] {committed!r}")
                             buf.add("audio", f"[audio-live] {committed}")
                             last_heard_text = committed
                             last_heard_ts = time.time()
-                    live_bus.update_sound(upd.committed, upd.partial)
+                    live_bus.update_sound(
+                        normalized_committed or upd.committed,
+                        normalized_partial or upd.partial,
+                    )
 
                 # Utterance collector (final transcript)
                 ready = collector.push(pcm)
@@ -792,6 +825,12 @@ def main() -> None:
                         buf.add("vision", f"[vision-vlm] error: {e}")
 
                 sensory_block = buf.snapshot_text() or "- (no observations captured)"
+                greeting_target: Optional[str] = None
+                if pending_identity_greetings:
+                    greeting_target = min(pending_identity_greetings.items(), key=lambda kv: kv[1])[0]
+                    if greeting_target not in who_set:
+                        greeting_target = None
+
                 decision = presence.decide(transcript_text=effective_transcript)
 
                 internal_note = (
@@ -802,6 +841,13 @@ def main() -> None:
                 )
 
                 active_response = response_session and response_session.is_active()
+                greeting_ready = (
+                    greeting_target
+                    and not active_response
+                    and (now - presence.state.last_spoke_ts) >= presence.state.cooldown_s
+                )
+                if greeting_ready:
+                    decision = Decision(True, "identity_greeting", max(decision.confidence, 0.9))
                 if decision.should_respond and not active_response:
                     live_context = live_bus.fusion.snapshot()
                     user_content = (
@@ -826,6 +872,19 @@ def main() -> None:
                     session_summary = load_summary(summary_path)
                     memories = list(mem_store.iter_items(limit=3000))
 
+                    if greeting_ready and greeting_target:
+                        greeting_memory_lines = format_identity_memories(
+                            greeting_target, memories, limit=5
+                        )
+                        user_content += (
+                            "\nIDENTITY_GREETING:\n"
+                            f"- Recognized {greeting_target} is present.\n"
+                            "- Offer a warm, concise greeting using their name.\n"
+                            "- Weave in any relevant shared memories naturally.\n"
+                        )
+                        if greeting_memory_lines:
+                            user_content += f"Relevant memories:\n{greeting_memory_lines}\n"
+
                     messages = build_messages(
                         system_prompt=SYSTEM_PROMPT,
                         session_summary=session_summary,
@@ -839,6 +898,10 @@ def main() -> None:
                     print("[Astra]>", end=" ", flush=True)
 
                     live_thought_accum = ""
+
+                    if greeting_ready and greeting_target:
+                        pending_identity_greetings.pop(greeting_target, None)
+                        last_identity_greeting[greeting_target] = now
 
                     response_session = ResponseSession(
                         client=client,
