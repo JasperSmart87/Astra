@@ -70,6 +70,8 @@ class PresenceEngine:
             print(
                 "[PRESENCE] rapidfuzz not installed; using built-in fuzzy fallback."
                 " Install full requirements for best wake detection."
+                "[PRESENCE] rapidfuzz not installed; wake-word fuzzy matching disabled."
+                " Install requirements to improve wake detection."
             )
 
     def tick(self, transcript_text: str) -> None:

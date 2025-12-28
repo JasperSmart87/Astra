@@ -20,6 +20,8 @@ def score_memory(query: str, mem: MemoryItem) -> float:
     if overlap == 0:
         return 0.0
     kind_bonus = 0.15 if mem.kind in ("preference", "fact") else 0.05
+    if mem.kind == "lesson":
+        kind_bonus = 0.2
     return (overlap / max(3, len(q))) * (0.6 + 0.4 * mem.importance) + kind_bonus
 
 
