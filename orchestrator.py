@@ -460,7 +460,9 @@ def main() -> None:
     vlm = VLMCaptioner(client, vlm_model) if vlm_model else VLMCaptioner(client, "")
     presence = PresenceEngine(wake_name=wake_name, cooldown_s=6.0)
 
-    tts = PiperTTS(PiperConfig(model_name="en_GB-alba-medium"))
+    tts = PiperTTS(
+        PiperConfig(model_name="en_GB-alba-medium", output_device=SETTINGS.audio_output_device)
+    )
     if tts.enabled:
         print("Piper TTS enabled (en_GB-alba-medium)")
     else:
