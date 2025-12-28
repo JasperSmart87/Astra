@@ -12,15 +12,8 @@ from typing import Any, Optional
 
 import numpy as np
 import queue
+import sounddevice as sd
 import time
-
-try:
-    import sounddevice as sd
-except ModuleNotFoundError as exc:  # pragma: no cover - environment-specific
-    sd = None
-    _IMPORT_ERROR = exc
-else:
-    _IMPORT_ERROR = None
 
 
 @dataclass
@@ -39,7 +32,7 @@ class MicrophoneSensor:
         self.sample_rate = sample_rate
         self.chunk_seconds = chunk_seconds
         self.device = device
-        self._stream: Optional[Any] = None
+        self._stream: Optional[sd.InputStream] = None
         self._queue: queue.Queue[np.ndarray] = queue.Queue()
         self._frames_per_chunk = int(self.sample_rate * self.chunk_seconds)
         self._fallback_blocking = False
@@ -61,11 +54,6 @@ class MicrophoneSensor:
 
     def start(self) -> None:
         """Start a low-latency input stream."""
-        if sd is None:  # pragma: no cover - environment-specific
-            raise ImportError(
-                "sounddevice is required for microphone capture. Install it from requirements.txt (PortAudio must be present)."
-            ) from _IMPORT_ERROR
-
         if self._stream:
             return
 
@@ -94,9 +82,6 @@ class MicrophoneSensor:
             sd.wait()
             recording = np.squeeze(recording)
             return AudioChunk(pcm=recording, sample_rate=self.sample_rate, duration=self.chunk_seconds)
-
-        if sd is None:  # pragma: no cover - environment-specific
-            raise RuntimeError("Microphone cannot start because sounddevice is missing") from _IMPORT_ERROR
 
         target_frames = self._frames_per_chunk
         collected: list[np.ndarray] = []
