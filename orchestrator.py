@@ -20,7 +20,9 @@ import os
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from collections import deque
+from pathlib import Path
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 from dotenv import load_dotenv
@@ -53,34 +55,40 @@ def env(key: str, default: str = "") -> str:
     return v if v is not None and v != "" else default
 
 
-def safe_add_vision(buf: RingBuffer, obs: Any) -> Optional[Any]:
+def safe_add_vision(buf: RingBuffer, obs: Any) -> tuple[Optional[Any], Optional[str]]:
     """Add a vision observation to the buffer.
 
-    Returns a usable frame (BGR) if present, else None.
+    Returns (frame_bgr, text) so that callers can stream the textual part into
+    the live context alongside the audio and VLM streams.
     """
     frame_bgr = None
+    text: Optional[str] = None
 
     if isinstance(obs, str):
         buf.add("vision", obs)
-        return None
+        text = obs
+        return None, text
 
     if hasattr(obs, "to_text") and callable(getattr(obs, "to_text")):
         try:
-            buf.add("vision", obs.to_text())
+            text = obs.to_text()
+            buf.add("vision", text)
         except Exception:
-            buf.add("vision", str(obs))
+            text = str(obs)
+            buf.add("vision", text)
     elif isinstance(obs, dict):
-        txt = obs.get("text") or obs.get("summary") or str(obs)
-        buf.add("vision", txt)
+        text = obs.get("text") or obs.get("summary") or str(obs)
+        buf.add("vision", text)
     else:
-        buf.add("vision", str(obs))
+        text = str(obs)
+        buf.add("vision", text)
 
     if hasattr(obs, "frame_bgr"):
         frame_bgr = getattr(obs, "frame_bgr")
     elif hasattr(obs, "frame"):
         frame_bgr = getattr(obs, "frame")
 
-    return frame_bgr
+    return frame_bgr, text
 
 
 def make_wake_normalizer(wake_name: str):
@@ -126,6 +134,94 @@ def loudest_channel(pcm: np.ndarray) -> np.ndarray:
     return pcm[:, loudest_idx]
 
 
+class LiveStreamFusion:
+    """Fuses sight, sound, speech, and thought into a live context snapshot."""
+
+    def __init__(self) -> None:
+        now = time.time()
+        self._sight: tuple[str, float] = ("", now)
+        self._sound: tuple[str, float] = ("", now)
+        self._thought: tuple[str, float] = ("", now)
+        self._identity: tuple[str, float] = ("unknown", now)
+
+    def update_sight(self, text: Optional[str]) -> None:
+        if text:
+            self._sight = (text.strip(), time.time())
+
+    def update_sound(self, committed: str, partial: str) -> None:
+        candidate = (committed or "").strip()
+        if partial:
+            candidate = f"{candidate} {partial}".strip() if candidate else partial.strip()
+        if candidate:
+            self._sound = (candidate, time.time())
+
+    def clear_sound(self) -> None:
+        self._sound = ("", time.time())
+
+    def update_thought(self, fragment: str) -> None:
+        frag = fragment.strip()
+        if not frag:
+            return
+        existing, ts = self._thought
+        if (time.time() - ts) > 4.0:
+            existing = ""
+        merged = (existing + frag)[-320:]
+        self._thought = (merged, time.time())
+
+    def update_identity(self, identities: set[str]) -> None:
+        label = ", ".join(sorted(identities)) if identities else "unknown"
+        self._identity = (label, time.time())
+
+    def snapshot(self) -> str:
+        now = time.time()
+
+        def fresh(entry: tuple[str, float], ttl: float) -> Optional[str]:
+            txt, ts = entry
+            if txt and (now - ts) <= ttl:
+                return txt
+            return None
+
+        lines = []
+        sight = fresh(self._sight, 6.0)
+        if sight:
+            lines.append(f"SIGHT: {sight}")
+        sound = fresh(self._sound, 3.0)
+        if sound:
+            lines.append(f"SOUND: {sound}")
+        who = fresh(self._identity, 8.0)
+        if who:
+            lines.append(f"IDENTITY: {who}")
+        thought = fresh(self._thought, 5.0)
+        if thought:
+            lines.append(f"THOUGHT: {thought}")
+
+        return "\n".join(lines)
+
+
+class VisionContextWindow:
+    """Maintain a short history of vision captions for temporal context."""
+
+    def __init__(self, max_items: int = 6, ttl_s: float = 18.0) -> None:
+        self.max_items = max_items
+        self.ttl_s = ttl_s
+        self._history: Deque[Tuple[str, float]] = deque()
+
+    def add(self, text: Optional[str]) -> None:
+        if not text:
+            return
+        self._history.append((text.strip(), time.time()))
+        while len(self._history) > self.max_items:
+            self._history.popleft()
+
+    def snapshot(self) -> List[str]:
+        now = time.time()
+        fresh: List[str] = []
+        for txt, ts in list(self._history):
+            if (now - ts) <= self.ttl_s:
+                fresh.append(txt)
+        return fresh
+
+
 class ResponseSession:
     """Run LM -> TTS streaming in a background thread.
 
@@ -143,7 +239,7 @@ class ResponseSession:
         temperature: float,
         max_tokens: int,
         user_content: str,
-        on_tts_chunk: Optional[Callable[[], None]] = None,
+        on_tts_chunk: Optional[Callable[[str], None]] = None,
         on_stream_start: Optional[Callable[[], None]] = None,
         on_stream_done: Optional[Callable[[], None]] = None,
         on_fragment: Optional[Callable[[str], None]] = None,
@@ -178,7 +274,7 @@ class ResponseSession:
         try:
             def _on_speak(_: str) -> None:
                 if self.on_tts_chunk:
-                    self.on_tts_chunk()
+                    self.on_tts_chunk(_)
 
             def _on_start() -> None:
                 if self.on_stream_start:
@@ -227,19 +323,27 @@ class SpeechBridge:
         self._block_until = 0.0
         self._lock = threading.Lock()
 
-    def _extend(self) -> None:
+    def _extend(self, extra_s: float = 0.0) -> None:
         with self._lock:
-            self._block_until = max(self._block_until, time.time() + self.block_s)
+            self._block_until = max(self._block_until, time.time() + self.block_s + extra_s)
+
+    @staticmethod
+    def _estimate_phrase_block(text: Optional[str]) -> float:
+        if not text:
+            return 0.0
+        words = max(1, len(text.split()))
+        # Roughly scale block by phrase length to avoid re-hearing ourselves.
+        return min(2.5, 0.08 * words)
 
     def on_stream_start(self) -> None:
         self._extend()
 
-    def pulse(self) -> None:
-        self._extend()
+    def pulse(self, text: Optional[str] = None) -> None:
+        self._extend(self._estimate_phrase_block(text))
 
     def on_stream_end(self) -> None:
         # Leave a small tail to let the room settle before listening again
-        self._extend()
+        self._extend(0.25)
 
     def should_skip_audio(self) -> bool:
         with self._lock:
@@ -250,7 +354,7 @@ def main() -> None:
     base_url = SETTINGS.lmstudio_base_url
     api_key = SETTINGS.lmstudio_api_key
     voice_model = env("LMSTUDIO_MODEL", SETTINGS.lmstudio_model)
-    vlm_model = env("VLM_MODEL", "").strip()
+    vlm_model = env("VLM_MODEL", "llama-joycaption-beta-one-hf-llava-mmproj").strip()
     wake_name = env("WAKE_NAME", SETTINGS.wake_name)
 
     normalize_wake = make_wake_normalizer(wake_name)
@@ -302,8 +406,26 @@ def main() -> None:
     HEARD_HOLD_S = 2.5
 
     # Identity
+    def resolve_faces_dir() -> str:
+        env_override = env("IDENTITY_FACES_DIR")
+        if env_override:
+            return env_override
+
+        script_dir = Path(__file__).resolve().parent
+        candidates = [
+            Path("C:/astra_main/faces"),
+            Path("C:\\astra_main\\faces"),
+            script_dir / "faces",
+            Path.cwd() / "faces",
+        ]
+        for cand in candidates:
+            if cand.exists():
+                return str(cand)
+        return str(candidates[0])
+
+    faces_dir = resolve_faces_dir()
     identity = IdentityRecognizer(
-        known_faces_dir=r"C:\astra_main\faces",
+        known_faces_dir=faces_dir,
         cooldown_s=10.0,
         debug=False,
     )
@@ -321,6 +443,8 @@ def main() -> None:
         pre_roll_s=0.25,
     )
 
+    live_streams = LiveStreamFusion()
+    vision_context = VisionContextWindow(max_items=8, ttl_s=22.0)
     live_thought_accum = ""
 
     def on_generation_fragment(frag: str) -> None:
@@ -332,7 +456,8 @@ def main() -> None:
         if len(live_thought_accum) > 320:
             live_thought_accum = live_thought_accum[-320:]
         buf.add("audio", f"[voice-stream] {frag.strip()}")
-        speech_bridge.pulse()
+        speech_bridge.pulse(frag)
+        live_streams.update_thought(frag)
 
     cam.start()
     mic.start()
@@ -347,11 +472,15 @@ def main() -> None:
     last_inject = 0.0
     last_frame_bgr = None
 
+    faces_path = Path(faces_dir)
+    faces_status = "found" if faces_path.exists() else "missing"
+
     print("Astra Orchestrator running (Ctrl+C to stop)")
     print(f"LM Studio base URL: {base_url}")
-    print(f"Voice model:         {voice_model}")
+    print(f"Voice model:         {voice_model or '(set LMSTUDIO_MODEL)'}")
     print(f"Vision model:        {vlm_model if vlm_model else '(disabled)'}")
     print(f"Wake name:           {wake_name}")
+    print(f"Faces directory:     {faces_dir} ({faces_status})")
 
     try:
         while True:
@@ -363,7 +492,9 @@ def main() -> None:
 
             try:
                 obs = cam.read()
-                frame_bgr = safe_add_vision(buf, obs)
+                frame_bgr, vision_text = safe_add_vision(buf, obs)
+                live_streams.update_sight(vision_text)
+                vision_context.add(vision_text)
                 if frame_bgr is not None:
                     _ = identity.process(frame_bgr)
                     current_identities = set(identity.present)
@@ -423,6 +554,7 @@ def main() -> None:
                             buf.add("audio", f"[audio-live] {committed}")
                             last_heard_text = committed
                             last_heard_ts = time.time()
+                    live_streams.update_sound(upd.committed, upd.partial)
 
                 # Utterance collector (final transcript)
                 ready = collector.push(pcm)
@@ -448,6 +580,7 @@ def main() -> None:
                             buf.add("audio", f"[audio] {transcript}")
                             last_heard_text = transcript
                             last_heard_ts = time.time()
+                            live_streams.update_sound(transcript, "")
             except _SkipAudio:
                 # Mic is muted for a moment (usually while TTS is speaking).
                 pass
@@ -504,6 +637,7 @@ def main() -> None:
                 else:
                     who = "unknown"
                     buf.add("vision", "[identity] present=unknown")
+                live_streams.update_identity(who_set)
 
                 # VLM caption occasionally
                 if vlm.enabled() and last_frame_bgr is not None:
@@ -514,11 +648,14 @@ def main() -> None:
                             "Rules:\n"
                             "- If identity label is not 'unknown', you MUST refer to the person as that name.\n"
                             "- If identity label is 'unknown', do NOT guess names.\n"
+                            "- Mention important on-screen details (text, UI, video actions) if visible.\n"
                             "- Write 1-3 sentences. Be natural and personal.\n"
                         )
                         cap = vlm.caption(last_frame_bgr, prompt, max_tokens=120)
                         if cap:
                             buf.add("vision", f"[vision-vlm] {cap}")
+                            live_streams.update_sight(cap)
+                            vision_context.add(cap)
                     except Exception as e:
                         buf.add("vision", f"[vision-vlm] error: {e}")
 
@@ -534,6 +671,7 @@ def main() -> None:
 
                 active_response = response_session and response_session.is_active()
                 if decision.should_respond and not active_response:
+                    live_context = live_streams.snapshot()
                     user_content = (
                         f"SENSORY_UPDATE:\n{sensory_block}\n\n"
                         f"INTERNAL_STATE:\n{internal_note}\n\n"
@@ -542,6 +680,13 @@ def main() -> None:
                         f"- Respond naturally, like a person in the room.\n"
                         f"- Keep it short and conversational unless asked otherwise.\n"
                     )
+                    vision_history = vision_context.snapshot()
+                    if vision_history:
+                        user_content += "\nVISION_CONTEXT (recent captions):\n" + "\n".join(
+                            f"- {entry}" for entry in vision_history
+                        ) + "\n"
+                    if live_context:
+                        user_content += f"\nLIVE_STREAM:\n{live_context}\n"
                     if pending_memory is not None:
                         user_content += "\nMEMORY_QUESTION:\nShould I remember the last thing you said for next time? (yes/no)\n"
 
