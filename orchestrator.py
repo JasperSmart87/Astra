@@ -20,7 +20,9 @@ import os
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from collections import deque
+from pathlib import Path
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 from dotenv import load_dotenv
@@ -53,34 +55,40 @@ def env(key: str, default: str = "") -> str:
     return v if v is not None and v != "" else default
 
 
-def safe_add_vision(buf: RingBuffer, obs: Any) -> Optional[Any]:
+def safe_add_vision(buf: RingBuffer, obs: Any) -> tuple[Optional[Any], Optional[str]]:
     """Add a vision observation to the buffer.
 
-    Returns a usable frame (BGR) if present, else None.
+    Returns (frame_bgr, text) so that callers can stream the textual part into
+    the live context alongside the audio and VLM streams.
     """
     frame_bgr = None
+    text: Optional[str] = None
 
     if isinstance(obs, str):
         buf.add("vision", obs)
-        return None
+        text = obs
+        return None, text
 
     if hasattr(obs, "to_text") and callable(getattr(obs, "to_text")):
         try:
-            buf.add("vision", obs.to_text())
+            text = obs.to_text()
+            buf.add("vision", text)
         except Exception:
-            buf.add("vision", str(obs))
+            text = str(obs)
+            buf.add("vision", text)
     elif isinstance(obs, dict):
-        txt = obs.get("text") or obs.get("summary") or str(obs)
-        buf.add("vision", txt)
+        text = obs.get("text") or obs.get("summary") or str(obs)
+        buf.add("vision", text)
     else:
-        buf.add("vision", str(obs))
+        text = str(obs)
+        buf.add("vision", text)
 
     if hasattr(obs, "frame_bgr"):
         frame_bgr = getattr(obs, "frame_bgr")
     elif hasattr(obs, "frame"):
         frame_bgr = getattr(obs, "frame")
 
-    return frame_bgr
+    return frame_bgr, text
 
 
 def make_wake_normalizer(wake_name: str):
@@ -126,6 +134,120 @@ def loudest_channel(pcm: np.ndarray) -> np.ndarray:
     return pcm[:, loudest_idx]
 
 
+def frame_motion_score(curr: np.ndarray, prev: np.ndarray) -> float:
+    """Lightweight frame delta metric to detect on-screen motion.
+
+    Uses a coarse downsampled absolute difference to stay fast enough for
+    real-time captioning triggers while Astra watches videos or dynamic
+    scenes.
+    """
+
+    if curr is None or prev is None:
+        return 0.0
+
+    try:
+        # Downsample aggressively by slicing to avoid OpenCV dependency here.
+        c_small = curr[::12, ::12]
+        p_small = prev[::12, ::12]
+        h = min(c_small.shape[0], p_small.shape[0])
+        w = min(c_small.shape[1], p_small.shape[1])
+        if h <= 0 or w <= 0:
+            return 0.0
+        c_small = c_small[:h, :w]
+        p_small = p_small[:h, :w]
+        return float(np.mean(np.abs(c_small.astype(np.float32) - p_small.astype(np.float32))))
+    except Exception:
+        return 0.0
+
+
+class LiveStreamFusion:
+    """Fuses sight, sound, speech, and thought into a live context snapshot."""
+
+    def __init__(self) -> None:
+        now = time.time()
+        self._sight: tuple[str, float] = ("", now)
+        self._sound: tuple[str, float] = ("", now)
+        self._thought: tuple[str, float] = ("", now)
+        self._identity: tuple[str, float] = ("unknown", now)
+
+    def update_sight(self, text: Optional[str]) -> None:
+        if text:
+            self._sight = (text.strip(), time.time())
+
+    def update_sound(self, committed: str, partial: str) -> None:
+        candidate = (committed or "").strip()
+        if partial:
+            candidate = f"{candidate} {partial}".strip() if candidate else partial.strip()
+        if candidate:
+            self._sound = (candidate, time.time())
+
+    def clear_sound(self) -> None:
+        self._sound = ("", time.time())
+
+    def update_thought(self, fragment: str) -> None:
+        frag = fragment.strip()
+        if not frag:
+            return
+        existing, ts = self._thought
+        if (time.time() - ts) > 4.0:
+            existing = ""
+        merged = (existing + frag)[-320:]
+        self._thought = (merged, time.time())
+
+    def update_identity(self, identities: set[str]) -> None:
+        label = ", ".join(sorted(identities)) if identities else "unknown"
+        self._identity = (label, time.time())
+
+    def snapshot(self) -> str:
+        now = time.time()
+
+        def fresh(entry: tuple[str, float], ttl: float) -> Optional[str]:
+            txt, ts = entry
+            if txt and (now - ts) <= ttl:
+                return txt
+            return None
+
+        lines = []
+        sight = fresh(self._sight, 6.0)
+        if sight:
+            lines.append(f"SIGHT: {sight}")
+        sound = fresh(self._sound, 3.0)
+        if sound:
+            lines.append(f"SOUND: {sound}")
+        who = fresh(self._identity, 8.0)
+        if who:
+            lines.append(f"IDENTITY: {who}")
+        thought = fresh(self._thought, 5.0)
+        if thought:
+            lines.append(f"THOUGHT: {thought}")
+
+        return "\n".join(lines)
+
+
+class VisionContextWindow:
+    """Maintain a short history of vision captions for temporal context."""
+
+    def __init__(self, max_items: int = 6, ttl_s: float = 18.0) -> None:
+        self.max_items = max_items
+        self.ttl_s = ttl_s
+        self._history: Deque[Tuple[str, float]] = deque()
+
+    def add(self, text: Optional[str]) -> None:
+        if not text:
+            return
+        self._history.append((text.strip(), time.time()))
+        while len(self._history) > self.max_items:
+            self._history.popleft()
+
+    def snapshot(self) -> List[str]:
+        now = time.time()
+        fresh: List[str] = []
+        for txt, ts in list(self._history):
+            if (now - ts) <= self.ttl_s:
+                fresh.append(txt)
+        return fresh
+
+
 class ResponseSession:
     """Run LM -> TTS streaming in a background thread.
 
@@ -143,7 +265,9 @@ class ResponseSession:
         temperature: float,
         max_tokens: int,
         user_content: str,
-        on_tts_chunk: Optional[Callable[[], None]] = None,
+        flush_chars: int,
+        max_wait_s: float,
+        on_tts_chunk: Optional[Callable[[str], None]] = None,
         on_stream_start: Optional[Callable[[], None]] = None,
         on_stream_done: Optional[Callable[[], None]] = None,
         on_fragment: Optional[Callable[[str], None]] = None,
@@ -154,6 +278,8 @@ class ResponseSession:
         self.messages = messages
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.flush_chars = flush_chars
+        self.max_wait_s = max_wait_s
         self.on_tts_chunk = on_tts_chunk
         self.on_stream_start = on_stream_start
         self.on_stream_done = on_stream_done
@@ -178,7 +304,7 @@ class ResponseSession:
         try:
             def _on_speak(_: str) -> None:
                 if self.on_tts_chunk:
-                    self.on_tts_chunk()
+                    self.on_tts_chunk(_)
 
             def _on_start() -> None:
                 if self.on_stream_start:
@@ -206,8 +332,8 @@ class ResponseSession:
 
             self.full_reply = self.tts.stream_fragments(
                 _chat_fragments(),
-                flush_chars=90,
-                max_wait_s=0.4,
+                flush_chars=self.flush_chars,
+                max_wait_s=self.max_wait_s,
                 on_speak=_on_speak,
                 on_start=_on_start,
                 on_chunk=_on_chunk,
@@ -227,19 +353,27 @@ class SpeechBridge:
         self._block_until = 0.0
         self._lock = threading.Lock()
 
-    def _extend(self) -> None:
+    def _extend(self, extra_s: float = 0.0) -> None:
         with self._lock:
-            self._block_until = max(self._block_until, time.time() + self.block_s)
+            self._block_until = max(self._block_until, time.time() + self.block_s + extra_s)
+
+    @staticmethod
+    def _estimate_phrase_block(text: Optional[str]) -> float:
+        if not text:
+            return 0.0
+        words = max(1, len(text.split()))
+        # Roughly scale block by phrase length to avoid re-hearing ourselves.
+        return min(2.5, 0.08 * words)
 
     def on_stream_start(self) -> None:
         self._extend()
 
-    def pulse(self) -> None:
-        self._extend()
+    def pulse(self, text: Optional[str] = None) -> None:
+        self._extend(self._estimate_phrase_block(text))
 
     def on_stream_end(self) -> None:
         # Leave a small tail to let the room settle before listening again
-        self._extend()
+        self._extend(0.25)
 
     def should_skip_audio(self) -> bool:
         with self._lock:
@@ -250,13 +384,21 @@ def main() -> None:
     base_url = SETTINGS.lmstudio_base_url
     api_key = SETTINGS.lmstudio_api_key
     voice_model = env("LMSTUDIO_MODEL", SETTINGS.lmstudio_model)
-    vlm_model = env("VLM_MODEL", "").strip()
+    vlm_model = env("VLM_MODEL", "llama-joycaption-beta-one-hf-llava-mmproj").strip()
     wake_name = env("WAKE_NAME", SETTINGS.wake_name)
 
     normalize_wake = make_wake_normalizer(wake_name)
 
     inject_every = SETTINGS.inject_every_seconds
     max_events = SETTINGS.max_context_events
+
+    # Streaming tunables (kept lightweight for real-time flow)
+    vlm_min_interval = float(env("VLM_MIN_INTERVAL_S", "6.5"))
+    vlm_motion_threshold = float(env("VLM_MOTION_THRESHOLD", "9.5"))
+    vlm_motion_min_interval = float(env("VLM_MOTION_MIN_INTERVAL_S", "3.0"))
+
+    tts_flush_chars = int(env("TTS_FLUSH_CHARS", "72"))
+    tts_max_wait = float(env("TTS_MAX_WAIT_S", "0.35"))
 
     # Debug knobs (safe to leave off)
     DEBUG_WHISPER_SEGS = env("DEBUG_WHISPER_SEGS", "0") in ("1", "true", "TRUE")
@@ -302,8 +444,26 @@ def main() -> None:
     HEARD_HOLD_S = 2.5
 
     # Identity
+    def resolve_faces_dir() -> str:
+        env_override = env("IDENTITY_FACES_DIR")
+        if env_override:
+            return env_override
+
+        script_dir = Path(__file__).resolve().parent
+        candidates = [
+            Path("C:/astra_main/faces"),
+            Path("C:\\astra_main\\faces"),
+            script_dir / "faces",
+            Path.cwd() / "faces",
+        ]
+        for cand in candidates:
+            if cand.exists():
+                return str(cand)
+        return str(candidates[0])
+
+    faces_dir = resolve_faces_dir()
     identity = IdentityRecognizer(
-        known_faces_dir=r"C:\astra_main\faces",
+        known_faces_dir=faces_dir,
         cooldown_s=10.0,
         debug=False,
     )
@@ -321,7 +481,13 @@ def main() -> None:
         pre_roll_s=0.25,
     )
 
+    live_streams = LiveStreamFusion()
+    vision_context = VisionContextWindow(max_items=8, ttl_s=22.0)
     live_thought_accum = ""
+    force_inject_reason: Optional[str] = None
+    last_vlm_caption_ts = 0.0
+    last_vlm_motion_ts = 0.0
+    last_motion_score = 0.0
 
     def on_generation_fragment(frag: str) -> None:
         nonlocal live_thought_accum
@@ -332,7 +498,8 @@ def main() -> None:
         if len(live_thought_accum) > 320:
             live_thought_accum = live_thought_accum[-320:]
         buf.add("audio", f"[voice-stream] {frag.strip()}")
-        speech_bridge.pulse()
+        speech_bridge.pulse(frag)
+        live_streams.update_thought(frag)
 
     cam.start()
     mic.start()
@@ -347,14 +514,22 @@ def main() -> None:
     last_inject = 0.0
     last_frame_bgr = None
 
+    faces_path = Path(faces_dir)
+    faces_status = "found" if faces_path.exists() else "missing"
+
     print("Astra Orchestrator running (Ctrl+C to stop)")
     print(f"LM Studio base URL: {base_url}")
-    print(f"Voice model:         {voice_model}")
+    print(f"Voice model:         {voice_model or '(set LMSTUDIO_MODEL)'}")
     print(f"Vision model:        {vlm_model if vlm_model else '(disabled)'}")
     print(f"Wake name:           {wake_name}")
+    print(f"Faces directory:     {faces_dir} ({faces_status})")
 
     try:
         while True:
+            now = time.time()
+            prev_frame_bgr = last_frame_bgr
+            if force_inject_reason and (now - last_inject) > 10:
+                force_inject_reason = None
             # ---------------------------
             # Vision
             # ---------------------------
@@ -363,13 +538,49 @@ def main() -> None:
 
             try:
                 obs = cam.read()
-                frame_bgr = safe_add_vision(buf, obs)
+                frame_bgr, vision_text = safe_add_vision(buf, obs)
+                live_streams.update_sight(vision_text)
+                vision_context.add(vision_text)
                 if frame_bgr is not None:
                     _ = identity.process(frame_bgr)
                     current_identities = set(identity.present)
                     if current_identities:
+                        is_new_identity = current_identities != last_known_identities
                         last_known_identities = set(current_identities)
                         last_identity_ts = time.time()
+                        live_streams.update_identity(current_identities)
+                        buf.add("vision", f"[identity] {', '.join(sorted(current_identities))}")
+                        if is_new_identity and not force_inject_reason:
+                            force_inject_reason = "New identity detected"
+                    motion_score = frame_motion_score(frame_bgr, prev_frame_bgr)
+                    last_motion_score = motion_score
+                    if motion_score >= vlm_motion_threshold * 0.6:
+                        buf.add("vision", f"[vision-motion] delta={motion_score:.2f}")
+                    if motion_score >= vlm_motion_threshold and (
+                        now - last_vlm_motion_ts
+                    ) >= vlm_motion_min_interval:
+                        try:
+                            who = ", ".join(sorted(current_identities or last_known_identities)) or "unknown"
+                            prompt = (
+                                "You are describing a live camera frame.\n"
+                                f"Identity label (authoritative): {who}\n"
+                                "Rules:\n"
+                                "- If identity label is not 'unknown', you MUST refer to the person as that name.\n"
+                                "- If identity label is 'unknown', do NOT guess names.\n"
+                                "- Mention important on-screen details (text, UI, video actions) if visible.\n"
+                                "- Write 1-2 sentences. Be natural and personal.\n"
+                            )
+                            cap = vlm.caption(frame_bgr, prompt, max_tokens=90)
+                            if cap:
+                                buf.add("vision", f"[vision-vlm-motion] {cap}")
+                                live_streams.update_sight(cap)
+                                vision_context.add(cap)
+                                last_vlm_motion_ts = now
+                                last_vlm_caption_ts = now
+                                if not force_inject_reason:
+                                    force_inject_reason = "Motion-triggered vision update"
+                        except Exception as e:
+                            buf.add("vision", f"[vision-vlm-motion] error: {e}")
                     last_frame_bgr = frame_bgr
             except Exception as e:
                 buf.add("vision", f"[vision] error: {e}")
@@ -423,6 +634,7 @@ def main() -> None:
                             buf.add("audio", f"[audio-live] {committed}")
                             last_heard_text = committed
                             last_heard_ts = time.time()
+                    live_streams.update_sound(upd.committed, upd.partial)
 
                 # Utterance collector (final transcript)
                 ready = collector.push(pcm)
@@ -448,6 +660,7 @@ def main() -> None:
                             buf.add("audio", f"[audio] {transcript}")
                             last_heard_text = transcript
                             last_heard_ts = time.time()
+                            live_streams.update_sound(transcript, "")
             except _SkipAudio:
                 # Mic is muted for a moment (usually while TTS is speaking).
                 pass
@@ -490,7 +703,11 @@ def main() -> None:
 
             presence.tick(transcript_text=effective_transcript)
 
-            if now - last_inject >= inject_every:
+            inject_due = (now - last_inject) >= inject_every or bool(transcript)
+
+            if inject_due:
+                if transcript and (now - last_inject) < inject_every:
+                    buf.add("audio", "[audio-live] forcing inject on fresh utterance")
                 # Identity context (hold last known briefly)
                 HOLD_IDENTITY_S = 3.0
 
@@ -504,9 +721,12 @@ def main() -> None:
                 else:
                     who = "unknown"
                     buf.add("vision", "[identity] present=unknown")
+                live_streams.update_identity(who_set)
 
                 # VLM caption occasionally
-                if vlm.enabled() and last_frame_bgr is not None:
+                if vlm.enabled() and last_frame_bgr is not None and (
+                    (now - last_vlm_caption_ts) >= vlm_min_interval
+                ):
                     try:
                         prompt = (
                             "You are describing a live camera frame.\n"
@@ -514,11 +734,15 @@ def main() -> None:
                             "Rules:\n"
                             "- If identity label is not 'unknown', you MUST refer to the person as that name.\n"
                             "- If identity label is 'unknown', do NOT guess names.\n"
+                            "- Mention important on-screen details (text, UI, video actions) if visible.\n"
                             "- Write 1-3 sentences. Be natural and personal.\n"
                         )
                         cap = vlm.caption(last_frame_bgr, prompt, max_tokens=120)
                         if cap:
                             buf.add("vision", f"[vision-vlm] {cap}")
+                            live_streams.update_sight(cap)
+                            vision_context.add(cap)
+                            last_vlm_caption_ts = now
                     except Exception as e:
                         buf.add("vision", f"[vision-vlm] error: {e}")
 
@@ -533,7 +757,9 @@ def main() -> None:
                 )
 
                 active_response = response_session and response_session.is_active()
-                if decision.should_respond and not active_response:
+                trigger_now = (decision.should_respond or bool(force_inject_reason)) and not active_response
+                if trigger_now:
+                    live_context = live_streams.snapshot()
                     user_content = (
                         f"SENSORY_UPDATE:\n{sensory_block}\n\n"
                         f"INTERNAL_STATE:\n{internal_note}\n\n"
@@ -542,6 +768,17 @@ def main() -> None:
                         f"- Respond naturally, like a person in the room.\n"
                         f"- Keep it short and conversational unless asked otherwise.\n"
                     )
+                    if force_inject_reason:
+                        user_content += f"\nTRIGGER:\n- {force_inject_reason}\n"
+                    if last_motion_score > 0:
+                        user_content += f"\nVISION_MOTION_DELTA: {last_motion_score:.2f}\n"
+                    vision_history = vision_context.snapshot()
+                    if vision_history:
+                        user_content += "\nVISION_CONTEXT (recent captions):\n" + "\n".join(
+                            f"- {entry}" for entry in vision_history
+                        ) + "\n"
+                    if live_context:
+                        user_content += f"\nLIVE_STREAM:\n{live_context}\n"
                     if pending_memory is not None:
                         user_content += "\nMEMORY_QUESTION:\nShould I remember the last thing you said for next time? (yes/no)\n"
 
@@ -569,6 +806,8 @@ def main() -> None:
                         messages=messages,
                         temperature=0.6,
                         max_tokens=int(env("LM_MAX_TOKENS", "550")),
+                        flush_chars=tts_flush_chars,
+                        max_wait_s=tts_max_wait,
                         user_content=user_content,
                         on_tts_chunk=speech_bridge.pulse,
                         on_stream_start=speech_bridge.on_stream_start,
@@ -577,6 +816,7 @@ def main() -> None:
                     )
                     response_session.start()
                     speech_bridge.on_stream_start()
+                    force_inject_reason = None
                 else:
                     print("\n[Silent tick]", internal_note)
 
@@ -621,3 +861,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

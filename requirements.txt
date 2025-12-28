@@ -6,4 +6,5 @@ pillow
 python-dotenv
 requests
 numpy
+scipy
 soundfile

@@ -6,12 +6,34 @@ LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1
 
 # Identifier of the chat model to use (as shown in LM Studio)
 LMSTUDIO_MODEL=nuofang/tifa-deepsexv2-7b-mgrpo
-# (Optional) Identifier of the vision-language model for image captioning
+# Identifier of the vision-language model for image captioning
 VLM_MODEL=llama-joycaption-beta-one-hf-llava-mmproj
 
 # The name the agent will respond to
 WAKE_NAME=Astra
+
+# Camera configuration
 CAMERA_INDEX=1
+CAMERA_FPS=1
+CAMERA_DOWNSCALE_WIDTH=320
+
+# Vision motion-to-caption tuning
+VLM_MIN_INTERVAL_S=6.5
+VLM_MOTION_THRESHOLD=9.5
+VLM_MOTION_MIN_INTERVAL_S=3.0
+
+# Audio configuration
 AUDIO_DEVICE=1
 AUDIO_SAMPLE_RATE=44100
-AUDIO_CHUNK_SECONDS=7
+AUDIO_CHUNK_SECONDS=0.25
+
+# TTS streaming tightness (lower for snappier fragments)
+TTS_FLUSH_CHARS=72
+TTS_MAX_WAIT_S=0.35
+
+# Event cadence and context buffering
+INJECT_EVERY_SECONDS=6
+MAX_CONTEXT_EVENTS=10
+
+# Path to face images (override if running outside the repo root)
+IDENTITY_FACES_DIR=C:\astra_main\faces
