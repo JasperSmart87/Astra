@@ -31,6 +31,7 @@ class PiperConfig:
     speaker: Optional[int] = None
     noise_scale: float = 0.667
     length_scale: float = 1.0
+    output_device: Optional[str | int] = None
 
 
 def clean_tts_text(text: str) -> str:
@@ -194,7 +195,8 @@ class PiperTTS:
         self.enabled = PiperVoice is not None
         self.status_reason = "piper package not installed" if not self.enabled else ""
         self.voice = None
-        self._play_fn = play_fn or self._play_audio
+        self._output_device = self._normalize_output_device(cfg.output_device)
+        self._play_fn = play_fn or self._make_play_fn()
 
         if self.enabled:
             model_path = self._resolve_model_path(cfg.model_name)
@@ -213,6 +215,13 @@ class PiperTTS:
             except Exception as exc:  # pragma: no cover - runtime environment dependent
                 self.enabled = False
                 self.status_reason = f"failed to load {model_path}: {exc}"
+
+    def _normalize_output_device(self, device: Optional[str | int]) -> Optional[str | int]:
+        """Coerce string device IDs to integers for sounddevice."""
+
+        if isinstance(device, str) and device.isdigit():
+            return int(device)
+        return device
 
     def _write_wave(self, audio_iter, buffer: io.BytesIO) -> None:
         writer = getattr(self.voice, "write_wav", None) or getattr(self.voice, "write_wave", None)
@@ -306,11 +315,18 @@ class PiperTTS:
             data, rate = self._iter_to_audio(audio_iter)
         return data, rate
 
-    @staticmethod
-    def _play_audio(data, rate: int) -> None:
-        sd.stop()
-        sd.play(data, rate)
-        sd.wait()
+    def _make_play_fn(self) -> Callable[[object, int], None]:
+        def _play_audio(data, rate: int) -> None:
+            try:
+                sd.stop()
+                sd.play(data, rate, device=self._output_device)
+                sd.wait()
+            except Exception as exc:  # pragma: no cover - runtime environment dependent
+                raise RuntimeError(
+                    f"sounddevice playback failed (device={self._output_device!r}): {exc}"
+                ) from exc
+
+        return _play_audio
 
     def speak(self, text: str) -> None:
         if not self.enabled or self.voice is None:

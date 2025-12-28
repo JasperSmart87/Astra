@@ -28,7 +28,9 @@ Copy `.env.example` to `.env` and set the following environment variables:
 * `VLM_MODEL` (optional) – The ID of the vision‑language model if you want image captions.
 * `WAKE_NAME` – The name Astra will respond to (default is `Astra`).
 
-You can also adjust other parameters in `config.py`, such as camera index, sample rate, and injection frequency.
+You can also adjust other parameters in `config.py`, such as camera index, sample rate, and injection frequency. Set
+`AUDIO_DEVICE` to choose the microphone input device and `AUDIO_OUTPUT_DEVICE` to direct text-to-speech playback to a
+specific speaker when the default output is incorrect.
 
 ## Running
 

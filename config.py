@@ -20,6 +20,7 @@ class Settings:
     audio_sample_rate: int = int(os.getenv("AUDIO_SAMPLE_RATE", 44100))
     audio_chunk_seconds: float = float(os.getenv("AUDIO_CHUNK_SECONDS", 0.25))
     audio_device: str | None = os.getenv("AUDIO_DEVICE", None)
+    audio_output_device: str | None = os.getenv("AUDIO_OUTPUT_DEVICE", None)
 
     # Event injection
     inject_every_seconds: int = int(os.getenv("INJECT_EVERY_SECONDS", 6))
