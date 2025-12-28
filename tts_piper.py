@@ -130,19 +130,42 @@ class PiperTTS:
     def _iter_to_audio(self, audio_iter) -> Tuple[Optional[np.ndarray], Optional[int]]:
         """Convert a Piper audio iterator into float32 PCM data and sample rate."""
 
-        chunks = []
-        sample_rate = getattr(getattr(self.voice, "config", None), "sample_rate", 24000)
-
-        for chunk in audio_iter:
+        def _extract(chunk) -> Optional[np.ndarray]:
             if chunk is None:
-                continue
+                return None
+
+            # Newer piper versions yield ``AudioChunk`` objects with a ``samples``
+            # attribute. Fall back to common alternatives before coercing directly.
+            if hasattr(chunk, "samples"):
+                chunk = getattr(chunk, "samples")
+            elif hasattr(chunk, "pcm"):
+                chunk = getattr(chunk, "pcm")
+            elif hasattr(chunk, "audio"):
+                chunk = getattr(chunk, "audio")
+
             arr = np.asarray(chunk)
             if arr.size == 0:
-                continue
+                return None
+            if arr.ndim > 1:
+                arr = arr[:, 0]
             if np.issubdtype(arr.dtype, np.integer):
                 arr = arr.astype(np.float32) / 32768.0
             else:
                 arr = arr.astype(np.float32)
+            return arr
+
+        chunks = []
+        sample_rate = getattr(getattr(self.voice, "config", None), "sample_rate", 24000)
+
+        for chunk in audio_iter:
+            arr = _extract(chunk)
+            if arr is None:
+                continue
+
+            chunk_rate = getattr(chunk, "sample_rate", None)
+            if chunk_rate:
+                sample_rate = chunk_rate
+
             chunks.append(arr)
 
         if not chunks:
