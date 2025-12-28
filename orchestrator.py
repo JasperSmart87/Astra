@@ -41,6 +41,7 @@ from memory.ring_buffer import RingBuffer
 from memory.memory_store import MemoryStore, MemoryItem
 from memory.memory_policy import hybrid_decide
 from memory.memory_summarize import update_summary, load_summary
+from memory.memory_condense import condense_memories
 from memory.memory_pack import build_messages
 
 from tts_piper import PiperTTS, PiperConfig
@@ -400,6 +401,12 @@ def main() -> None:
     tts_flush_chars = int(env("TTS_FLUSH_CHARS", "72"))
     tts_max_wait = float(env("TTS_MAX_WAIT_S", "0.35"))
 
+    memory_condense_every = int(env("MEMORY_CONDENSE_EVERY", "5"))
+    memory_keep_recent = int(env("MEMORY_KEEP_RECENT", "50"))
+    memory_target_lessons = int(env("MEMORY_TARGET_LESSONS", "10"))
+    memory_min_items = int(env("MEMORY_CONDENSE_MIN_ITEMS", "120"))
+    memory_max_items = int(env("MEMORY_MAX_ITEMS", "800"))
+
     # Debug knobs (safe to leave off)
     DEBUG_WHISPER_SEGS = env("DEBUG_WHISPER_SEGS", "0") in ("1", "true", "TRUE")
     DEBUG_PARTIALS = env("DEBUG_PARTIALS", "0") in ("1", "true", "TRUE")
@@ -422,6 +429,7 @@ def main() -> None:
     recent_dialogue: List[Dict[str, Any]] = []
     pending_memory: Optional[MemoryItem] = None
     inject_count = 0
+    last_condense_inject = 0
 
     # Sensors
     cam = CameraSensor(SETTINGS.camera_index, SETTINGS.camera_fps, SETTINGS.camera_downscale_width)
@@ -849,6 +857,29 @@ def main() -> None:
                             print("[SUMMARY] updated")
                         except Exception as e:
                             print("[SUMMARY] update failed:", e)
+
+                    if (
+                        inject_count - last_condense_inject >= memory_condense_every
+                        and len(memories) >= memory_min_items
+                    ):
+                        try:
+                            did_condense, lesson_count = condense_memories(
+                                client=client,
+                                model=voice_model,
+                                store=mem_store,
+                                keep_recent=memory_keep_recent,
+                                target_lessons=memory_target_lessons,
+                                max_items=memory_max_items,
+                                min_items=memory_min_items,
+                            )
+                            if did_condense:
+                                last_condense_inject = inject_count
+                                print(
+                                    f"[MEMORY] condensed backlog into {lesson_count} lessons "
+                                    f"(kept {memory_keep_recent} most recent)"
+                                )
+                        except Exception as e:
+                            print("[MEMORY] condense failed:", e)
 
                 response_session = None
 
