@@ -10,7 +10,6 @@ import inspect
 import io
 import re
 import time
-import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Tuple
@@ -101,7 +100,6 @@ class PiperTTS:
         return None
 
     def __init__(self, cfg: PiperConfig, play_fn: Optional[Callable[[object, int], None]] = None):
-    def __init__(self, cfg: PiperConfig):
         self.cfg = cfg
         self.enabled = PiperVoice is not None
         self.status_reason = "piper package not installed" if not self.enabled else ""
