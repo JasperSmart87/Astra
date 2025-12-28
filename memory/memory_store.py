@@ -34,6 +34,23 @@ class MemoryStore:
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
+    def rewrite(self, items: Iterable[MemoryItem]) -> None:
+        """Rewrite the store with a fresh ordered list of items.
+
+        This lets condensation/cleanup steps replace older raw memories with
+        summarized lessons while keeping the store compact for retrieval.
+        """
+
+        d = os.path.dirname(self.path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+
+        tmp_path = self.path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for item in items:
+                f.write(json.dumps(asdict(item), ensure_ascii=False) + "\n")
+        os.replace(tmp_path, self.path)
+
     def iter_items(self, limit: int = 5000) -> Iterable[MemoryItem]:
         if not os.path.exists(self.path):
             return []

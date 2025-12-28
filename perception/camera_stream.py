@@ -10,7 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import cv2
+try:
+    import cv2
+except ModuleNotFoundError as exc:  # pragma: no cover - environment-specific
+    cv2 = None
+    _IMPORT_ERROR = exc
+else:
+    _IMPORT_ERROR = None
 import numpy as np
 import time
 
@@ -40,6 +46,10 @@ class CameraSensor:
         self.prev_gray: np.ndarray | None = None
 
     def start(self) -> None:
+        if cv2 is None:  # pragma: no cover - environment-specific
+            raise ImportError(
+                "OpenCV (cv2) is required for vision capture. Install opencv-python from requirements.txt"
+            ) from _IMPORT_ERROR
         self.cap = cv2.VideoCapture(self.camera_index)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open camera index {self.camera_index}")
@@ -63,11 +73,12 @@ class CameraSensor:
             diff = cv2.absdiff(gray, self.prev_gray)
             motion = float(np.mean(diff))
         self.prev_gray = gray
-        return CameraObservation(motion=motion,
-    brightness=brightness,
-    frame=frame,   # <-- PASS THE FRAME THROUGH
-    ts=time.time()
-)
+        return CameraObservation(
+            motion=motion,
+            brightness=brightness,
+            frame=frame,  # <-- PASS THE FRAME THROUGH
+            ts=time.time(),
+        )
 
     def stop(self) -> None:
         if self.cap is not None:
