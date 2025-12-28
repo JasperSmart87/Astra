@@ -242,6 +242,19 @@ class PiperTTS:
             else:
                 arr = np.asarray(chunk)
 
+                # Some Piper builds return opaque AudioChunk objects without a direct array
+                # representation. If ``np.asarray`` yields an object array, try common payload
+                # fields, and skip unconvertible chunks to avoid ``float(AudioChunk)`` errors.
+                if arr.dtype == object:
+                    payload = getattr(chunk, "audio", None) or getattr(chunk, "data", None)
+                    if payload is not None:
+                        arr = np.asarray(payload)
+                    if arr.dtype == object:
+                        try:
+                            arr = arr.astype(np.float32)
+                        except (TypeError, ValueError):
+                            continue
+
             if arr.size == 0:
                 continue
             if arr.ndim > 1:
