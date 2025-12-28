@@ -38,12 +38,18 @@ def clean_tts_text(text: str) -> str:
 
     t = text
 
-    # Remove common mojibake / encoding artifacts
-    t = t.replace("â€™", "'")
-    t = t.replace("â€œ", '"').replace("â€", '"')
-    t = t.replace("â€¦", "...")
-    t = t.replace("â€“", "-").replace("â€”", "-")
-    t = t.replace("â¦", "...")
+    # Remove common mojibake / encoding artifacts using safe escape sequences
+    replacements = {
+        "\u00e2\u20ac\u2122": "'",  # curly apostrophe mis-decoded as UTF-8 -> cp1252
+        "\u00e2\u20ac\u0153": '"',  # open quote garble
+        "\u00e2\u20ac\u009d": '"',  # close quote garble
+        "\u00e2\u20ac\u00a6": "...",  # ellipsis garble
+        "\u00e2\u20ac\u201c": "-",  # en dash garble
+        "\u00e2\u20ac\u201d": "-",  # em dash garble
+        "\u2026": "...",  # real ellipsis
+    }
+    for bad, good in replacements.items():
+        t = t.replace(bad, good)
 
     # Strip non-printable characters
     t = "".join(ch for ch in t if ch.isprintable() or ch in "\n\t")
