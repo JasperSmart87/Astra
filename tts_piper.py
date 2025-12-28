@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Tuple
 
+import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
@@ -126,6 +127,30 @@ class PiperTTS:
             raise RuntimeError("PiperVoice missing write_wav/write_wave helpers")
         writer(buffer, audio_iter)
 
+    def _iter_to_audio(self, audio_iter) -> Tuple[Optional[np.ndarray], Optional[int]]:
+        """Convert a Piper audio iterator into float32 PCM data and sample rate."""
+
+        chunks = []
+        sample_rate = getattr(getattr(self.voice, "config", None), "sample_rate", 24000)
+
+        for chunk in audio_iter:
+            if chunk is None:
+                continue
+            arr = np.asarray(chunk)
+            if arr.size == 0:
+                continue
+            if np.issubdtype(arr.dtype, np.integer):
+                arr = arr.astype(np.float32) / 32768.0
+            else:
+                arr = arr.astype(np.float32)
+            chunks.append(arr)
+
+        if not chunks:
+            return None, None
+
+        data = np.concatenate(chunks)
+        return data, int(sample_rate) if sample_rate else None
+
     def _render_audio(self, cleaned: str, kwargs: dict) -> Tuple[Optional[object], Optional[int]]:
         params = set()
         try:
@@ -148,10 +173,14 @@ class PiperTTS:
         except TypeError:
             audio_iter = self.voice.synthesize(cleaned)
 
-        buf = io.BytesIO()
-        self._write_wave(audio_iter, buf)
-        buf.seek(0)
-        data, rate = sf.read(buf, dtype="float32")
+        has_writer = hasattr(self.voice, "write_wav") or hasattr(self.voice, "write_wave")
+        if has_writer:
+            buf = io.BytesIO()
+            self._write_wave(audio_iter, buf)
+            buf.seek(0)
+            data, rate = sf.read(buf, dtype="float32")
+        else:
+            data, rate = self._iter_to_audio(audio_iter)
         return data, rate
 
     @staticmethod

@@ -566,7 +566,7 @@ def main() -> None:
                         is_new_identity = current_identities != last_known_identities
                         last_known_identities = set(current_identities)
                         last_identity_ts = time.time()
-                        live_streams.update_identity(current_identities)
+                        live_bus.update_identity(current_identities)
                         buf.add("vision", f"[identity] {', '.join(sorted(current_identities))}")
                         if is_new_identity and not force_inject_reason:
                             force_inject_reason = "New identity detected"
@@ -591,7 +591,7 @@ def main() -> None:
                             cap = vlm.caption(frame_bgr, prompt, max_tokens=90)
                             if cap:
                                 buf.add("vision", f"[vision-vlm-motion] {cap}")
-                                live_streams.update_sight(cap)
+                                live_bus.update_sight(cap)
                                 vision_context.add(cap)
                                 last_vlm_motion_ts = now
                                 last_vlm_caption_ts = now
