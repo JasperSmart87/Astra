@@ -13,7 +13,6 @@ Wake detection:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from email.mime import text
 import re
 import time
 
@@ -58,6 +57,12 @@ class PresenceEngine:
     def __init__(self, wake_name: str = "Astra", cooldown_s: float = 6.0) -> None:
         self.state = PresenceState(wake_name=wake_name, cooldown_s=cooldown_s)
         self._last_tick = time.time()
+
+        if _rf_ratio is None:
+            print(
+                "[PRESENCE] rapidfuzz not installed; wake-word fuzzy matching disabled."
+                " Install requirements to improve wake detection."
+            )
 
     def tick(self, transcript_text: str) -> None:
         """Update slow-changing internal state based on conversation activity."""
