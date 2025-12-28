@@ -265,6 +265,8 @@ class ResponseSession:
         temperature: float,
         max_tokens: int,
         user_content: str,
+        flush_chars: int = 90,
+        max_wait_s: float = 0.4,
         on_tts_chunk: Optional[Callable[[str], None]] = None,
         on_stream_start: Optional[Callable[[], None]] = None,
         on_stream_done: Optional[Callable[[], None]] = None,

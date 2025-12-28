@@ -13,6 +13,7 @@ Wake detection:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import difflib
 import re
 import time
 
@@ -67,6 +68,8 @@ class PresenceEngine:
 
         if _rf_ratio is None:
             print(
+                "[PRESENCE] rapidfuzz not installed; using built-in fuzzy fallback."
+                " Install full requirements for best wake detection."
                 "[PRESENCE] rapidfuzz not installed; wake-word fuzzy matching disabled."
                 " Install requirements to improve wake detection."
             )
