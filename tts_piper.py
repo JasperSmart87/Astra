@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import time
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Tuple
@@ -118,12 +119,28 @@ class PiperTTS:
         # print("[TTS][CLEAN]", cleaned)
 
         try:
-            self.voice.synthesize(
-                cleaned,
-                speaker_id=self.cfg.speaker,
-                noise_scale=self.cfg.noise_scale,
-                length_scale=self.cfg.length_scale,
-            )
+            params = set()
+            try:
+                params = set(inspect.signature(self.voice.synthesize).parameters)
+            except (TypeError, ValueError):  # pragma: no cover - signature may be missing
+                params = set()
+
+            kwargs = {}
+            if "speaker_id" in params and self.cfg.speaker is not None:
+                kwargs["speaker_id"] = self.cfg.speaker
+            if "noise_scale" in params:
+                kwargs["noise_scale"] = self.cfg.noise_scale
+            if "length_scale" in params:
+                kwargs["length_scale"] = self.cfg.length_scale
+
+            try:
+                self.voice.synthesize(cleaned, **kwargs)
+                return
+            except TypeError:
+                # Fallback to positional-only synthesize signatures that don't accept kwargs.
+                pass
+
+            self.voice.synthesize(cleaned)
         except Exception as e:
             print("[TTS] error:", e)
 
