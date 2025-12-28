@@ -27,6 +27,8 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 import numpy as np
 from dotenv import load_dotenv
 
+load_dotenv()
+
 from agent.prompts import SYSTEM_PROMPT
 from config import SETTINGS
 from lmstudio_client import LMStudioClient
@@ -46,8 +48,6 @@ from memory.memory_pack import build_messages
 from tts_piper import PiperTTS, PiperConfig
 from vision_vlm import VLMCaptioner
 from vision_identity import IdentityRecognizer
-
-load_dotenv()
 
 
 def env(key: str, default: str = "") -> str:
