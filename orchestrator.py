@@ -159,6 +159,14 @@ class LiveStreamFusion:
     def clear_sound(self) -> None:
         self._sound = ("", time.time())
 
+    def latest_sound(self, ttl: float = 3.0) -> str:
+        """Return the freshest sound snippet within ``ttl`` seconds, if any."""
+
+        sound, ts = self._sound
+        if sound and (time.time() - ts) <= ttl:
+            return sound
+        return ""
+
     def update_thought(self, fragment: str) -> None:
         frag = fragment.strip()
         if not frag:
@@ -717,6 +725,8 @@ def main() -> None:
             effective_transcript = transcript
             if (not effective_transcript) and (now - last_heard_ts) <= HEARD_HOLD_S:
                 effective_transcript = last_heard_text
+            if not effective_transcript:
+                effective_transcript = live_bus.fusion.latest_sound(ttl=HEARD_HOLD_S)
 
             presence.tick(transcript_text=effective_transcript)
 
