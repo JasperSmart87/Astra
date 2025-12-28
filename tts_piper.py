@@ -216,9 +216,30 @@ class PiperTTS:
 
         try:
             audio_data, sample_rate = self._render_audio(cleaned, {})
-            if audio_data is None or sample_rate is None:
+            if audio_data is None:
                 return
-            self._play_fn(audio_data, sample_rate)
+
+            # ``sounddevice`` expects a numeric array; if a custom audio container sneaks
+            # through, normalize it to float32 PCM before playback.
+            pcm = getattr(audio_data, "pcm", None)
+            if pcm is not None:
+                sample_rate = sample_rate or getattr(audio_data, "sample_rate", None)
+                audio_data = pcm
+
+            audio_arr = np.asarray(audio_data)
+            if audio_arr.size == 0:
+                return
+            if audio_arr.ndim > 1:
+                audio_arr = audio_arr[:, 0]
+            if np.issubdtype(audio_arr.dtype, np.integer):
+                audio_arr = audio_arr.astype(np.float32) / 32768.0
+            else:
+                audio_arr = audio_arr.astype(np.float32)
+
+            if sample_rate is None:
+                return
+
+            self._play_fn(audio_arr, int(sample_rate))
             params = set()
             try:
                 params = set(inspect.signature(self.voice.synthesize).parameters)
