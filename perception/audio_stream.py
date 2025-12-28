@@ -8,7 +8,7 @@ structure containing the PCM waveform and associated metadata.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import queue
