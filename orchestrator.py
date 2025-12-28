@@ -430,6 +430,7 @@ def main() -> None:
     normalize_wake = make_wake_normalizer(wake_name)
 
     inject_every = SETTINGS.inject_every_seconds
+    turn_based_mode = env("TURN_BASED_MODE", "1").lower() in {"1", "true", "yes"}
     max_events = SETTINGS.max_context_events
 
     # Streaming tunables (kept lightweight for real-time flow)
@@ -578,6 +579,57 @@ def main() -> None:
     print(f"Vision model:        {vlm_model if vlm_model else '(disabled)'}")
     print(f"Wake name:           {wake_name}")
     print(f"Faces directory:     {faces_dir} ({faces_status})")
+    print(f"Interaction mode:    {'turn-based' if turn_based_mode else 'live streaming'}")
+
+    def update_dialogue_history(user_content: str, reply: str) -> None:
+        nonlocal recent_dialogue, inject_count, last_condense_inject, memories
+
+        recent_dialogue.append({"role": "user", "content": user_content})
+        recent_dialogue.append({"role": "assistant", "content": reply})
+        recent_dialogue = recent_dialogue[-20:]
+
+        inject_count += 1
+        if inject_count % 3 == 0:
+            try:
+                update_summary(
+                    client=client,
+                    model=voice_model,
+                    summary_path=summary_path,
+                    recent_dialogue=recent_dialogue[-10:],
+                )
+                print("[SUMMARY] updated")
+            except Exception as e:
+                print("[SUMMARY] update failed:", e)
+
+        if (
+            inject_count - last_condense_inject >= memory_condense_every
+            and len(memories) >= memory_min_items
+        ):
+            try:
+                did_condense, lesson_count = condense_memories(
+                    client=client,
+                    model=voice_model,
+                    store=mem_store,
+                    keep_recent=memory_keep_recent,
+                    target_lessons=memory_target_lessons,
+                    max_items=memory_max_items,
+                    min_items=memory_min_items,
+                )
+                if did_condense:
+                    last_condense_inject = inject_count
+                    print(
+                        f"[MEMORY] condensed backlog into {lesson_count} lessons "
+                        f"(kept {memory_keep_recent} most recent)"
+                    )
+            except Exception as e:
+                print("[MEMORY] condense failed:", e)
+
+    def finalize_reply(full_reply: str, user_content: str, *, already_ended_stream: bool) -> None:
+        if full_reply.strip() and not already_ended_stream:
+            speech_bridge.on_stream_end()
+
+        presence.mark_spoke()
+        update_dialogue_history(user_content, full_reply)
 
     try:
         while True:
@@ -840,7 +892,9 @@ def main() -> None:
                     f"confidence={decision.confidence:.2f}"
                 )
 
-                active_response = response_session and response_session.is_active()
+                active_response = (
+                    False if turn_based_mode else (response_session and response_session.is_active())
+                )
                 greeting_ready = (
                     greeting_target
                     and not active_response
@@ -903,24 +957,45 @@ def main() -> None:
                         pending_identity_greetings.pop(greeting_target, None)
                         last_identity_greeting[greeting_target] = now
 
-                    response_session = ResponseSession(
-                        client=client,
-                        tts=tts,
-                        voice_model=voice_model,
-                        messages=messages,
-                        temperature=0.6,
-                        max_tokens=int(env("LM_MAX_TOKENS", "550")),
-                        flush_chars=tts_flush_chars,
-                        max_wait_s=tts_max_wait,
-                        user_content=user_content,
-                        on_tts_chunk=speech_bridge.pulse,
-                        on_stream_start=speech_bridge.on_stream_start,
-                        on_stream_done=speech_bridge.on_stream_end,
-                        on_fragment=on_generation_fragment,
-                    )
-                    response_session.start()
-                    speech_bridge.on_stream_start()
-                    force_inject_reason = None
+                    if turn_based_mode:
+                        try:
+                            full_reply = client.chat(
+                                voice_model,
+                                messages,
+                                temperature=0.6,
+                                max_tokens=int(env("LM_MAX_TOKENS", "550")),
+                            )
+                            print(full_reply)
+
+                            speech_bridge.on_stream_start()
+                            if full_reply.strip() and tts.enabled:
+                                tts.speak(full_reply)
+                            speech_bridge.on_stream_end()
+
+                            finalize_reply(full_reply, user_content, already_ended_stream=True)
+                            force_inject_reason = None
+                        except Exception as e:
+                            print("[VOICE] turn-based error:", e)
+                            buf.add("audio", f"[voice] error: {e}")
+                    else:
+                        response_session = ResponseSession(
+                            client=client,
+                            tts=tts,
+                            voice_model=voice_model,
+                            messages=messages,
+                            temperature=0.6,
+                            max_tokens=int(env("LM_MAX_TOKENS", "550")),
+                            flush_chars=tts_flush_chars,
+                            max_wait_s=tts_max_wait,
+                            user_content=user_content,
+                            on_tts_chunk=speech_bridge.pulse,
+                            on_stream_start=speech_bridge.on_stream_start,
+                            on_stream_done=speech_bridge.on_stream_end,
+                            on_fragment=on_generation_fragment,
+                        )
+                        response_session.start()
+                        speech_bridge.on_stream_start()
+                        force_inject_reason = None
                 else:
                     print("\n[Silent tick]", internal_note)
 
@@ -934,48 +1009,7 @@ def main() -> None:
                     buf.add("audio", f"[voice] error: {response_session.error}")
                 else:
                     full_reply = response_session.full_reply
-                    if full_reply.strip():
-                        speech_bridge.on_stream_end()
-                    presence.mark_spoke()
-                    recent_dialogue.append({"role": "user", "content": response_session.user_content})
-                    recent_dialogue.append({"role": "assistant", "content": full_reply})
-                    recent_dialogue = recent_dialogue[-20:]
-
-                    inject_count += 1
-                    if inject_count % 3 == 0:
-                        try:
-                            update_summary(
-                                client=client,
-                                model=voice_model,
-                                summary_path=summary_path,
-                                recent_dialogue=recent_dialogue[-10:],
-                            )
-                            print("[SUMMARY] updated")
-                        except Exception as e:
-                            print("[SUMMARY] update failed:", e)
-
-                    if (
-                        inject_count - last_condense_inject >= memory_condense_every
-                        and len(memories) >= memory_min_items
-                    ):
-                        try:
-                            did_condense, lesson_count = condense_memories(
-                                client=client,
-                                model=voice_model,
-                                store=mem_store,
-                                keep_recent=memory_keep_recent,
-                                target_lessons=memory_target_lessons,
-                                max_items=memory_max_items,
-                                min_items=memory_min_items,
-                            )
-                            if did_condense:
-                                last_condense_inject = inject_count
-                                print(
-                                    f"[MEMORY] condensed backlog into {lesson_count} lessons "
-                                    f"(kept {memory_keep_recent} most recent)"
-                                )
-                        except Exception as e:
-                            print("[MEMORY] condense failed:", e)
+                    finalize_reply(full_reply, response_session.user_content, already_ended_stream=True)
 
                 response_session = None
 
