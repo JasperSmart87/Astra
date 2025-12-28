@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional, Tuple
 
 import numpy as np
+import requests
 import sounddevice as sd
 import soundfile as sf
 
@@ -71,6 +72,87 @@ def clean_tts_text(text: str) -> str:
 
 class PiperTTS:
     @staticmethod
+    def _voice_metadata_path(name: str) -> Optional[Path]:
+        """Return the companion ``.onnx.json`` metadata path, if present."""
+
+        candidates = []
+
+        raw = Path(name)
+        if raw.suffix == ".onnx":
+            candidates.append(raw.with_suffix(".onnx.json"))
+        candidates.append(raw)
+        candidates.append(raw.with_suffix(".onnx.json"))
+
+        cwd_raw = Path.cwd() / name
+        if cwd_raw != raw:
+            if cwd_raw.suffix == ".onnx":
+                candidates.append(cwd_raw.with_suffix(".onnx.json"))
+            candidates.append(cwd_raw)
+            candidates.append(cwd_raw.with_suffix(".onnx.json"))
+
+        for cand in candidates:
+            if cand.is_file() and cand.suffix == ".json":
+                return cand
+
+        return None
+
+    @staticmethod
+    def _voice_download_url(name: str) -> Optional[str]:
+        """Best-effort derivation of the HuggingFace Piper voice URL.
+
+        Voice bundles follow the pattern ``<lang>_<variant>-<voice>-<size>``. For
+        example, ``en_GB-alba-medium`` maps to the path
+        ``en/en_GB/alba/medium/en_GB-alba-medium.onnx``.
+        """
+
+        match = re.match(r"^(?P<lang>[a-z]{2})_(?P<variant>[A-Za-z]+)-(?P<voice>[A-Za-z]+)-(?P<size>[a-z]+)$", name)
+        if not match:
+            return None
+
+        parts = match.groupdict()
+        return (
+            "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+            f"{parts['lang']}/{parts['lang']}_{parts['variant']}/{parts['voice']}/{parts['size']}/{name}.onnx"
+        )
+
+    @staticmethod
+    def _metadata_to_voice_name(meta_path: Path) -> str:
+        """Strip known suffixes from a metadata filename to recover the voice id."""
+
+        if meta_path.name.endswith(".onnx.json"):
+            return meta_path.name[: -len(".onnx.json")]
+        return meta_path.stem
+
+    @staticmethod
+    def _download_voice_model(name: str, meta_path: Path) -> Optional[Path]:
+        """Download a Piper voice next to its metadata if missing.
+
+        This keeps TTS working out-of-the-box when only the ``.onnx.json``
+        metadata is present in the repository.
+        """
+
+        url = PiperTTS._voice_download_url(name)
+        if not url:
+            return None
+
+        dest = meta_path.with_suffix(".onnx")
+        try:
+            resp = requests.get(url, stream=True, timeout=30)
+            resp.raise_for_status()
+
+            with dest.open("wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    fh.write(chunk)
+            return dest
+        except Exception:
+            # Fail quietly; caller will surface a friendly status_reason.
+            if dest.exists():
+                dest.unlink(missing_ok=True)
+            return None
+
+    @staticmethod
     def _resolve_model_path(name: str) -> Optional[Path]:
         """Return a usable ONNX model path for Piper.
 
@@ -98,6 +180,13 @@ class PiperTTS:
             if cand.is_file() and cand.suffix == ".onnx":
                 return cand
 
+        meta = PiperTTS._voice_metadata_path(name)
+        if meta:
+            voice_name = PiperTTS._metadata_to_voice_name(meta)
+            downloaded = PiperTTS._download_voice_model(voice_name, meta)
+            if downloaded and downloaded.is_file():
+                return downloaded
+
         return None
 
     def __init__(self, cfg: PiperConfig, play_fn: Optional[Callable[[object, int], None]] = None):
@@ -111,7 +200,11 @@ class PiperTTS:
             model_path = self._resolve_model_path(cfg.model_name)
             if not model_path:
                 self.enabled = False
-                self.status_reason = f"model not found: {cfg.model_name} (.onnx file required)"
+                meta = self._voice_metadata_path(cfg.model_name)
+                download_hint = " (download failed)" if meta else ""
+                self.status_reason = (
+                    f"model not found: {cfg.model_name} (.onnx file required){download_hint}"
+                )
                 return
 
             try:
