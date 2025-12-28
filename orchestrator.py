@@ -20,7 +20,9 @@ import os
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from collections import deque
+from pathlib import Path
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 from dotenv import load_dotenv
@@ -39,6 +41,7 @@ from memory.ring_buffer import RingBuffer
 from memory.memory_store import MemoryStore, MemoryItem
 from memory.memory_policy import hybrid_decide
 from memory.memory_summarize import update_summary, load_summary
+from memory.memory_condense import condense_memories
 from memory.memory_pack import build_messages
 
 from tts_piper import PiperTTS, PiperConfig
@@ -273,6 +276,8 @@ class ResponseSession:
         self.messages = messages
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.flush_chars = flush_chars
+        self.max_wait_s = max_wait_s
         self.on_tts_chunk = on_tts_chunk
         self.on_stream_start = on_stream_start
         self.on_stream_done = on_stream_done
@@ -325,8 +330,8 @@ class ResponseSession:
 
             self.full_reply = self.tts.stream_fragments(
                 _chat_fragments(),
-                flush_chars=90,
-                max_wait_s=0.4,
+                flush_chars=self.flush_chars,
+                max_wait_s=self.max_wait_s,
                 on_speak=_on_speak,
                 on_start=_on_start,
                 on_chunk=_on_chunk,
@@ -377,13 +382,32 @@ def main() -> None:
     base_url = SETTINGS.lmstudio_base_url
     api_key = SETTINGS.lmstudio_api_key
     voice_model = env("LMSTUDIO_MODEL", SETTINGS.lmstudio_model)
-    vlm_model = env("VLM_MODEL", "").strip()
+    vlm_model = env("VLM_MODEL", "llama-joycaption-beta-one-hf-llava-mmproj").strip()
     wake_name = env("WAKE_NAME", SETTINGS.wake_name)
 
     normalize_wake = make_wake_normalizer(wake_name)
 
     inject_every = SETTINGS.inject_every_seconds
     max_events = SETTINGS.max_context_events
+
+    # Streaming tunables (kept lightweight for real-time flow)
+    vlm_min_interval = float(env("VLM_MIN_INTERVAL_S", "6.5"))
+    vlm_motion_threshold = float(env("VLM_MOTION_THRESHOLD", "9.5"))
+    vlm_motion_min_interval = float(env("VLM_MOTION_MIN_INTERVAL_S", "3.0"))
+
+    tts_flush_chars = int(env("TTS_FLUSH_CHARS", "72"))
+    tts_max_wait = float(env("TTS_MAX_WAIT_S", "0.35"))
+
+    memory_condense_every = int(env("MEMORY_CONDENSE_EVERY", "5"))
+    memory_keep_recent = int(env("MEMORY_KEEP_RECENT", "50"))
+    memory_target_lessons = int(env("MEMORY_TARGET_LESSONS", "10"))
+    memory_min_items = int(env("MEMORY_CONDENSE_MIN_ITEMS", "120"))
+    memory_max_items = int(env("MEMORY_MAX_ITEMS", "800"))
+
+    print(
+        "[Models] LM=", voice_model or "<unset>",
+        " | VLM=", vlm_model or "<disabled>",
+    )
 
     # Debug knobs (safe to leave off)
     DEBUG_WHISPER_SEGS = env("DEBUG_WHISPER_SEGS", "0") in ("1", "true", "TRUE")
@@ -407,6 +431,7 @@ def main() -> None:
     recent_dialogue: List[Dict[str, Any]] = []
     pending_memory: Optional[MemoryItem] = None
     inject_count = 0
+    last_condense_inject = 0
 
     # Sensors
     cam = CameraSensor(SETTINGS.camera_index, SETTINGS.camera_fps, SETTINGS.camera_downscale_width)
@@ -429,8 +454,26 @@ def main() -> None:
     HEARD_HOLD_S = 4.0
 
     # Identity
+    def resolve_faces_dir() -> str:
+        env_override = env("IDENTITY_FACES_DIR")
+        if env_override:
+            return env_override
+
+        script_dir = Path(__file__).resolve().parent
+        candidates = [
+            Path("C:/astra_main/faces"),
+            Path("C:\\astra_main\\faces"),
+            script_dir / "faces",
+            Path.cwd() / "faces",
+        ]
+        for cand in candidates:
+            if cand.exists():
+                return str(cand)
+        return str(candidates[0])
+
+    faces_dir = resolve_faces_dir()
     identity = IdentityRecognizer(
-        known_faces_dir=r"C:\astra_main\faces",
+        known_faces_dir=faces_dir,
         cooldown_s=10.0,
         debug=False,
     )
@@ -450,6 +493,10 @@ def main() -> None:
 
     live_bus = StreamingContextBus(buf)
     live_thought_accum = ""
+    force_inject_reason: Optional[str] = None
+    last_vlm_caption_ts = 0.0
+    last_vlm_motion_ts = 0.0
+    last_motion_score = 0.0
 
     def on_generation_fragment(frag: str) -> None:
         nonlocal live_thought_accum
@@ -476,14 +523,22 @@ def main() -> None:
     last_inject = 0.0
     last_frame_bgr = None
 
+    faces_path = Path(faces_dir)
+    faces_status = "found" if faces_path.exists() else "missing"
+
     print("Astra Orchestrator running (Ctrl+C to stop)")
     print(f"LM Studio base URL: {base_url}")
-    print(f"Voice model:         {voice_model}")
+    print(f"Voice model:         {voice_model or '(set LMSTUDIO_MODEL)'}")
     print(f"Vision model:        {vlm_model if vlm_model else '(disabled)'}")
     print(f"Wake name:           {wake_name}")
+    print(f"Faces directory:     {faces_dir} ({faces_status})")
 
     try:
         while True:
+            now = time.time()
+            prev_frame_bgr = last_frame_bgr
+            if force_inject_reason and (now - last_inject) > 10:
+                force_inject_reason = None
             # ---------------------------
             # Vision
             # ---------------------------
@@ -498,8 +553,42 @@ def main() -> None:
                     _ = identity.process(frame_bgr)
                     current_identities = set(identity.present)
                     if current_identities:
+                        is_new_identity = current_identities != last_known_identities
                         last_known_identities = set(current_identities)
                         last_identity_ts = time.time()
+                        live_streams.update_identity(current_identities)
+                        buf.add("vision", f"[identity] {', '.join(sorted(current_identities))}")
+                        if is_new_identity and not force_inject_reason:
+                            force_inject_reason = "New identity detected"
+                    motion_score = frame_motion_score(frame_bgr, prev_frame_bgr)
+                    last_motion_score = motion_score
+                    if motion_score >= vlm_motion_threshold * 0.6:
+                        buf.add("vision", f"[vision-motion] delta={motion_score:.2f}")
+                    if motion_score >= vlm_motion_threshold and (
+                        now - last_vlm_motion_ts
+                    ) >= vlm_motion_min_interval:
+                        try:
+                            who = ", ".join(sorted(current_identities or last_known_identities)) or "unknown"
+                            prompt = (
+                                "You are describing a live camera frame.\n"
+                                f"Identity label (authoritative): {who}\n"
+                                "Rules:\n"
+                                "- If identity label is not 'unknown', you MUST refer to the person as that name.\n"
+                                "- If identity label is 'unknown', do NOT guess names.\n"
+                                "- Mention important on-screen details (text, UI, video actions) if visible.\n"
+                                "- Write 1-2 sentences. Be natural and personal.\n"
+                            )
+                            cap = vlm.caption(frame_bgr, prompt, max_tokens=90)
+                            if cap:
+                                buf.add("vision", f"[vision-vlm-motion] {cap}")
+                                live_streams.update_sight(cap)
+                                vision_context.add(cap)
+                                last_vlm_motion_ts = now
+                                last_vlm_caption_ts = now
+                                if not force_inject_reason:
+                                    force_inject_reason = "Motion-triggered vision update"
+                        except Exception as e:
+                            buf.add("vision", f"[vision-vlm-motion] error: {e}")
                     last_frame_bgr = frame_bgr
             except Exception as e:
                 buf.add("vision", f"[vision] error: {e}")
@@ -629,7 +718,11 @@ def main() -> None:
 
             presence.tick(transcript_text=effective_transcript)
 
-            if now - last_inject >= inject_every:
+            inject_due = (now - last_inject) >= inject_every or bool(transcript)
+
+            if inject_due:
+                if transcript and (now - last_inject) < inject_every:
+                    buf.add("audio", "[audio-live] forcing inject on fresh utterance")
                 # Identity context (hold last known briefly)
                 HOLD_IDENTITY_S = 3.0
 
@@ -646,7 +739,9 @@ def main() -> None:
                 live_bus.update_identity(who_set)
 
                 # VLM caption occasionally
-                if vlm.enabled() and last_frame_bgr is not None:
+                if vlm.enabled() and last_frame_bgr is not None and (
+                    (now - last_vlm_caption_ts) >= vlm_min_interval
+                ):
                     try:
                         prompt = (
                             "You are describing a live camera frame.\n"
@@ -654,6 +749,7 @@ def main() -> None:
                             "Rules:\n"
                             "- If identity label is not 'unknown', you MUST refer to the person as that name.\n"
                             "- If identity label is 'unknown', do NOT guess names.\n"
+                            "- Mention important on-screen details (text, UI, video actions) if visible.\n"
                             "- Write 1-3 sentences. Be natural and personal.\n"
                         )
                         cap = vlm.caption(last_frame_bgr, prompt, max_tokens=120)
@@ -719,6 +815,8 @@ def main() -> None:
                         messages=messages,
                         temperature=0.6,
                         max_tokens=int(env("LM_MAX_TOKENS", "550")),
+                        flush_chars=tts_flush_chars,
+                        max_wait_s=tts_max_wait,
                         user_content=user_content,
                         on_tts_chunk=speech_bridge.pulse,
                         on_stream_start=speech_bridge.on_stream_start,
@@ -727,6 +825,7 @@ def main() -> None:
                     )
                     response_session.start()
                     speech_bridge.on_stream_start()
+                    force_inject_reason = None
                 else:
                     print("\n[Silent tick]", internal_note)
 
@@ -759,6 +858,29 @@ def main() -> None:
                             print("[SUMMARY] updated")
                         except Exception as e:
                             print("[SUMMARY] update failed:", e)
+
+                    if (
+                        inject_count - last_condense_inject >= memory_condense_every
+                        and len(memories) >= memory_min_items
+                    ):
+                        try:
+                            did_condense, lesson_count = condense_memories(
+                                client=client,
+                                model=voice_model,
+                                store=mem_store,
+                                keep_recent=memory_keep_recent,
+                                target_lessons=memory_target_lessons,
+                                max_items=memory_max_items,
+                                min_items=memory_min_items,
+                            )
+                            if did_condense:
+                                last_condense_inject = inject_count
+                                print(
+                                    f"[MEMORY] condensed backlog into {lesson_count} lessons "
+                                    f"(kept {memory_keep_recent} most recent)"
+                                )
+                        except Exception as e:
+                            print("[MEMORY] condense failed:", e)
 
                 response_session = None
 
