@@ -132,18 +132,18 @@ class PiperTTS:
 
         def _extract(chunk) -> Optional[np.ndarray]:
             if chunk is None:
-                return None
+                continue
 
-            # Newer piper versions yield ``AudioChunk`` objects with a ``samples``
-            # attribute. Fall back to common alternatives before coercing directly.
-            if hasattr(chunk, "samples"):
-                chunk = getattr(chunk, "samples")
-            elif hasattr(chunk, "pcm"):
-                chunk = getattr(chunk, "pcm")
-            elif hasattr(chunk, "audio"):
-                chunk = getattr(chunk, "audio")
+            # Piper may emit custom chunk containers; prefer the raw PCM payload when present.
+            pcm = getattr(chunk, "pcm", None)
+            if pcm is not None:
+                arr = np.asarray(pcm)
+                chunk_rate = getattr(chunk, "sample_rate", None)
+                if chunk_rate:
+                    sample_rate = chunk_rate
+            else:
+                arr = np.asarray(chunk)
 
-            arr = np.asarray(chunk)
             if arr.size == 0:
                 return None
             if arr.ndim > 1:
@@ -152,20 +152,7 @@ class PiperTTS:
                 arr = arr.astype(np.float32) / 32768.0
             else:
                 arr = arr.astype(np.float32)
-            return arr
-
-        chunks = []
-        sample_rate = getattr(getattr(self.voice, "config", None), "sample_rate", 24000)
-
-        for chunk in audio_iter:
-            arr = _extract(chunk)
-            if arr is None:
-                continue
-
-            chunk_rate = getattr(chunk, "sample_rate", None)
-            if chunk_rate:
-                sample_rate = chunk_rate
-
+            arr = arr.reshape(-1)
             chunks.append(arr)
 
         if not chunks:

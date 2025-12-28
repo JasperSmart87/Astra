@@ -24,6 +24,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 from dotenv import load_dotenv
 
@@ -122,6 +123,25 @@ def audio_levels(pcm: np.ndarray) -> tuple[float, float, bool]:
     peak = float(np.max(np.abs(pcm)))
     clipped = bool(peak >= 0.999)
     return rms, peak, clipped
+
+
+def frame_motion_score(frame_bgr: Optional[np.ndarray], prev_frame_bgr: Optional[np.ndarray]) -> float:
+    """Return a simple motion score between the current and previous frames."""
+
+    if frame_bgr is None or prev_frame_bgr is None:
+        return 0.0
+
+    try:
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        prev_gray = cv2.cvtColor(prev_frame_bgr, cv2.COLOR_BGR2GRAY)
+
+        if gray.shape != prev_gray.shape:
+            prev_gray = cv2.resize(prev_gray, (gray.shape[1], gray.shape[0]))
+
+        diff = cv2.absdiff(gray, prev_gray)
+        return float(np.mean(diff))
+    except Exception:
+        return 0.0
 
 
 def loudest_channel(pcm: np.ndarray) -> np.ndarray:
