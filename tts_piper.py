@@ -6,12 +6,17 @@ Adds a small text-cleaning pass to avoid weird characters being spoken
 
 from __future__ import annotations
 
+import inspect
+import io
 import re
 import time
 import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Tuple
+
+import sounddevice as sd
+import soundfile as sf
 
 try:
     from piper import PiperVoice  # type: ignore
@@ -87,11 +92,13 @@ class PiperTTS:
 
         return None
 
+    def __init__(self, cfg: PiperConfig, play_fn: Optional[Callable[[object, int], None]] = None):
     def __init__(self, cfg: PiperConfig):
         self.cfg = cfg
         self.enabled = PiperVoice is not None
         self.status_reason = "piper package not installed" if not self.enabled else ""
         self.voice = None
+        self._play_fn = play_fn or self._play_audio
 
         if self.enabled:
             model_path = self._resolve_model_path(cfg.model_name)
@@ -107,6 +114,46 @@ class PiperTTS:
                 self.enabled = False
                 self.status_reason = f"failed to load {model_path}: {exc}"
 
+    def _write_wave(self, audio_iter, buffer: io.BytesIO) -> None:
+        writer = getattr(self.voice, "write_wav", None) or getattr(self.voice, "write_wave", None)
+        if not writer:
+            raise RuntimeError("PiperVoice missing write_wav/write_wave helpers")
+        writer(buffer, audio_iter)
+
+    def _render_audio(self, cleaned: str, kwargs: dict) -> Tuple[Optional[object], Optional[int]]:
+        params = set()
+        try:
+            params = set(inspect.signature(self.voice.synthesize).parameters)
+        except (TypeError, ValueError):  # pragma: no cover - signature may be missing
+            params = set()
+
+        synth_kwargs = {}
+        if "speaker_id" in params and self.cfg.speaker is not None:
+            synth_kwargs["speaker_id"] = self.cfg.speaker
+        if "noise_scale" in params:
+            synth_kwargs["noise_scale"] = self.cfg.noise_scale
+        if "length_scale" in params:
+            synth_kwargs["length_scale"] = self.cfg.length_scale
+
+        synth_kwargs.update(kwargs)
+
+        try:
+            audio_iter = self.voice.synthesize(cleaned, **synth_kwargs)
+        except TypeError:
+            audio_iter = self.voice.synthesize(cleaned)
+
+        buf = io.BytesIO()
+        self._write_wave(audio_iter, buf)
+        buf.seek(0)
+        data, rate = sf.read(buf, dtype="float32")
+        return data, rate
+
+    @staticmethod
+    def _play_audio(data, rate: int) -> None:
+        sd.stop()
+        sd.play(data, rate)
+        sd.wait()
+
     def speak(self, text: str) -> None:
         if not self.enabled or self.voice is None:
             return
@@ -119,6 +166,10 @@ class PiperTTS:
         # print("[TTS][CLEAN]", cleaned)
 
         try:
+            audio_data, sample_rate = self._render_audio(cleaned, {})
+            if audio_data is None or sample_rate is None:
+                return
+            self._play_fn(audio_data, sample_rate)
             params = set()
             try:
                 params = set(inspect.signature(self.voice.synthesize).parameters)
