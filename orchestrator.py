@@ -423,7 +423,7 @@ def main() -> None:
     if tts.enabled:
         print("Piper TTS enabled (en_GB-alba-medium)")
     else:
-        print("Piper TTS disabled (piper not installed)")
+        print(f"Piper TTS disabled ({tts.status_reason})")
 
     buf = RingBuffer(max_events=max_events)
 
