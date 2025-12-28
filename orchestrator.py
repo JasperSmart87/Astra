@@ -262,6 +262,8 @@ class ResponseSession:
         temperature: float,
         max_tokens: int,
         user_content: str,
+        flush_chars: int = 90,
+        max_wait_s: float = 0.4,
         on_tts_chunk: Optional[Callable[[str], None]] = None,
         on_stream_start: Optional[Callable[[], None]] = None,
         on_stream_done: Optional[Callable[[], None]] = None,
@@ -273,6 +275,8 @@ class ResponseSession:
         self.messages = messages
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.flush_chars = flush_chars
+        self.max_wait_s = max_wait_s
         self.on_tts_chunk = on_tts_chunk
         self.on_stream_start = on_stream_start
         self.on_stream_done = on_stream_done
@@ -325,8 +329,8 @@ class ResponseSession:
 
             self.full_reply = self.tts.stream_fragments(
                 _chat_fragments(),
-                flush_chars=90,
-                max_wait_s=0.4,
+                flush_chars=self.flush_chars,
+                max_wait_s=self.max_wait_s,
                 on_speak=_on_speak,
                 on_start=_on_start,
                 on_chunk=_on_chunk,
@@ -397,7 +401,7 @@ def main() -> None:
     if tts.enabled:
         print("Piper TTS enabled (en_GB-alba-medium)")
     else:
-        print("Piper TTS disabled (piper not installed)")
+        print(f"Piper TTS disabled ({tts.status_reason})")
 
     buf = RingBuffer(max_events=max_events)
 
@@ -426,7 +430,7 @@ def main() -> None:
     # Presence helper: hold most recent heard speech briefly
     last_heard_text = ""
     last_heard_ts = 0.0
-    HEARD_HOLD_S = 2.5
+    HEARD_HOLD_S = 4.0
 
     # Identity
     identity = IdentityRecognizer(
@@ -540,11 +544,18 @@ def main() -> None:
                             print(f"  {a:5.2f}s → {b:5.2f}s | {t!r}")
                         print("[WHISPER][STREAM][END]\n")
 
-                    if DEBUG_PARTIALS and upd.partial:
-                        nowp = time.time()
-                        if (nowp - last_partial_print) >= 0.5:
-                            print(f"[WHISPER][STREAM][PARTIAL] {upd.partial!r}")
-                            last_partial_print = nowp
+                    if upd.partial:
+                        partial_norm = normalize_wake(upd.partial.strip())
+                        if DEBUG_PARTIALS:
+                            nowp = time.time()
+                            if (nowp - last_partial_print) >= 0.5:
+                                print(f"[WHISPER][STREAM][PARTIAL] {partial_norm!r}")
+                                last_partial_print = nowp
+
+                        # If the live partial already sounds like an address, keep it warm
+                        if partial_norm and presence._contains_wake_name(partial_norm):
+                            last_heard_text = partial_norm
+                            last_heard_ts = time.time()
 
                     if upd.committed:
                         committed = normalize_wake(upd.committed.strip())

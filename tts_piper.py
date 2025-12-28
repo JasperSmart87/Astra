@@ -6,10 +6,16 @@ Adds a small text-cleaning pass to avoid weird characters being spoken
 
 from __future__ import annotations
 
+import inspect
+import io
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Iterable, Optional, Tuple
+
+import sounddevice as sd
+import soundfile as sf
 
 try:
     from piper import PiperVoice  # type: ignore
@@ -31,12 +37,18 @@ def clean_tts_text(text: str) -> str:
 
     t = text
 
-    # Remove common mojibake / encoding artifacts
-    t = t.replace("â€™", "'")
-    t = t.replace("â€œ", '"').replace("â€", '"')
-    t = t.replace("â€¦", "...")
-    t = t.replace("â€“", "-").replace("â€”", "-")
-    t = t.replace("â¦", "...")
+    # Remove common mojibake / encoding artifacts using safe escape sequences
+    replacements = {
+        "\u00e2\u20ac\u2122": "'",  # curly apostrophe mis-decoded as UTF-8 -> cp1252
+        "\u00e2\u20ac\u0153": '"',  # open quote garble
+        "\u00e2\u20ac\u009d": '"',  # close quote garble
+        "\u00e2\u20ac\u00a6": "...",  # ellipsis garble
+        "\u00e2\u20ac\u201c": "-",  # en dash garble
+        "\u00e2\u20ac\u201d": "-",  # em dash garble
+        "\u2026": "...",  # real ellipsis
+    }
+    for bad, good in replacements.items():
+        t = t.replace(bad, good)
 
     # Strip non-printable characters
     t = "".join(ch for ch in t if ch.isprintable() or ch in "\n\t")
@@ -55,16 +67,96 @@ def clean_tts_text(text: str) -> str:
 
 
 class PiperTTS:
-    def __init__(self, cfg: PiperConfig):
+    @staticmethod
+    def _resolve_model_path(name: str) -> Optional[Path]:
+        """Return a usable ONNX model path for Piper.
+
+        Accepts either a bare basename ("en_GB-alba-medium"), a path without an
+        extension, or a direct path to an ``.onnx`` file. If a matching ``.onnx``
+        exists next to a provided ``.json`` file, it is preferred.
+        """
+
+        candidates = []
+
+        raw = Path(name)
+        if raw.suffix == ".json":
+            candidates.append(raw.with_suffix(""))
+        candidates.append(raw)
+        candidates.append(raw.with_suffix(".onnx"))
+
+        cwd_raw = Path.cwd() / name
+        if cwd_raw != raw:
+            if cwd_raw.suffix == ".json":
+                candidates.append(cwd_raw.with_suffix(""))
+            candidates.append(cwd_raw)
+            candidates.append(cwd_raw.with_suffix(".onnx"))
+
+        for cand in candidates:
+            if cand.is_file() and cand.suffix == ".onnx":
+                return cand
+
+        return None
+
+    def __init__(self, cfg: PiperConfig, play_fn: Optional[Callable[[object, int], None]] = None):
         self.cfg = cfg
         self.enabled = PiperVoice is not None
+        self.status_reason = "piper package not installed" if not self.enabled else ""
         self.voice = None
+        self._play_fn = play_fn or self._play_audio
 
         if self.enabled:
-            try:
-                self.voice = PiperVoice.load(cfg.model_name)
-            except Exception:
+            model_path = self._resolve_model_path(cfg.model_name)
+            if not model_path:
                 self.enabled = False
+                self.status_reason = f"model not found: {cfg.model_name} (.onnx file required)"
+                return
+
+            try:
+                self.voice = PiperVoice.load(str(model_path))
+                self.status_reason = "ready"
+            except Exception as exc:  # pragma: no cover - runtime environment dependent
+                self.enabled = False
+                self.status_reason = f"failed to load {model_path}: {exc}"
+
+    def _write_wave(self, audio_iter, buffer: io.BytesIO) -> None:
+        writer = getattr(self.voice, "write_wav", None) or getattr(self.voice, "write_wave", None)
+        if not writer:
+            raise RuntimeError("PiperVoice missing write_wav/write_wave helpers")
+        writer(buffer, audio_iter)
+
+    def _render_audio(self, cleaned: str, kwargs: dict) -> Tuple[Optional[object], Optional[int]]:
+        params = set()
+        try:
+            params = set(inspect.signature(self.voice.synthesize).parameters)
+        except (TypeError, ValueError):  # pragma: no cover - signature may be missing
+            params = set()
+
+        synth_kwargs = {}
+        if "speaker_id" in params and self.cfg.speaker is not None:
+            synth_kwargs["speaker_id"] = self.cfg.speaker
+        if "noise_scale" in params:
+            synth_kwargs["noise_scale"] = self.cfg.noise_scale
+        if "length_scale" in params:
+            synth_kwargs["length_scale"] = self.cfg.length_scale
+
+        synth_kwargs.update(kwargs)
+
+        try:
+            audio_iter = self.voice.synthesize(cleaned, **synth_kwargs)
+        except TypeError:
+            audio_iter = self.voice.synthesize(cleaned)
+
+        buf = io.BytesIO()
+        self._write_wave(audio_iter, buf)
+        buf.seek(0)
+        data, rate = sf.read(buf, dtype="float32")
+        return data, rate
+
+    @staticmethod
+    def _play_audio(data, rate: int) -> None:
+        sd.stop()
+        sd.play(data, rate)
+        sd.wait()
 
     def speak(self, text: str) -> None:
         if not self.enabled or self.voice is None:
@@ -78,12 +170,10 @@ class PiperTTS:
         # print("[TTS][CLEAN]", cleaned)
 
         try:
-            self.voice.synthesize(
-                cleaned,
-                speaker_id=self.cfg.speaker,
-                noise_scale=self.cfg.noise_scale,
-                length_scale=self.cfg.length_scale,
-            )
+            audio_data, sample_rate = self._render_audio(cleaned, {})
+            if audio_data is None or sample_rate is None:
+                return
+            self._play_fn(audio_data, sample_rate)
         except Exception as e:
             print("[TTS] error:", e)
 
@@ -130,7 +220,7 @@ class PiperTTS:
                 if frag:
                     if on_chunk:
                         on_chunk(frag)
-                    full_text += frag
+                full_text += frag
             if on_complete:
                 on_complete(full_text)
             return full_text
